@@ -186,3 +186,9 @@ habitat-lab/
 GroundingDINO/
 __pycache__/
 *.pyc
+
+# Local experimental outputs - keep only curated probe/run scripts
+outputs/**/*.png
+outputs/**/__pycache__/
+outputs/2026-*/
+outputs/sim_only_logs/
