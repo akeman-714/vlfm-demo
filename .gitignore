@@ -192,3 +192,7 @@ outputs/**/*.png
 outputs/**/__pycache__/
 outputs/2026-*/
 outputs/sim_only_logs/
+# Exception: keep the curated demo media under outputs/vlfm_itm_video_demo/
+!outputs/vlfm_itm_video_demo/
+!outputs/vlfm_itm_video_demo/*.png
+!outputs/vlfm_itm_video_demo/*.mp4

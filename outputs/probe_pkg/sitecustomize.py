@@ -34,16 +34,6 @@ import numpy as np
 
 
 # ---- per-process state -------------------------------------------------
-# If PROBE_SAVE_FRAMES_DIR is set, every rgb frame seen at the SIM tap gets
-# written to that directory as a PNG.  This bypasses habitat-baselines'
-# video pipeline (which SIGABRTs on this VLFM config when video_option=[disk]
-# is enabled - see outputs/vlfm_split_gpu_video.log) and lets us prove
-# visually that the cross-GPU isolation is producing live, varied frames.
-_SAVE_DIR = os.environ.get("PROBE_SAVE_FRAMES_DIR", "")
-_SAVE_EVERY = max(1, int(os.environ.get("PROBE_SAVE_EVERY", "1")))
-if _SAVE_DIR:
-    os.makedirs(_SAVE_DIR, exist_ok=True)
-
 _STEP = {
     "sim": 0,           # subprocess sim sensor reads
     "task": 0,          # subprocess task.step
@@ -82,41 +72,6 @@ def _print(msg: str) -> None:
     # one print per line, immediate flush, atomic enough for our purposes
     sys.stderr.write(msg + "\n")
     sys.stderr.flush()
-
-
-def _save_rgb_to_png(rgb, step: int) -> None:
-    """Best-effort: write a single RGB frame to PROBE_SAVE_FRAMES_DIR as
-    frame_<step:06d>.png.  Silently no-ops if PIL/imageio isn't available
-    or the frame isn't the expected uint8/rgb shape.  We deliberately do
-    NOT call cv2 here: cv2.VideoWriter is what blew up the trainer's video
-    pipeline (SIGABRT mid-episode), so we stay clear of it.
-    """
-    if not _SAVE_DIR or rgb is None:
-        return
-    if step % _SAVE_EVERY != 0:
-        return
-    try:
-        if hasattr(rgb, "cpu"):
-            rgb = rgb.detach().cpu().numpy()
-        arr = np.asarray(rgb)
-        if arr.ndim == 3 and arr.shape[-1] == 4:
-            arr = arr[..., :3]  # habitat-sim COLOR sensor is RGBA
-        if arr.dtype != np.uint8:
-            a = arr.astype(np.float64)
-            if a.max() <= 1.0 + 1e-3:
-                a = a * 255.0
-            arr = np.clip(a, 0, 255).astype(np.uint8)
-        path = os.path.join(_SAVE_DIR, f"frame_{step:06d}.png")
-        try:
-            from PIL import Image
-            Image.fromarray(arr).save(path)
-        except Exception:
-            import imageio.v2 as iio
-            iio.imwrite(path, arr)
-    except Exception as e:
-        # Never let frame dumping break the trainer
-        with contextlib.suppress(Exception):
-            _log("FRAME_SAVE_ERR", step=step, err=repr(e))
 
 
 def _log(tag: str, **fields) -> None:
@@ -356,7 +311,6 @@ def _patch_sim_get_sensor_observations():
                 agent_rot=rot_str,
                 pre_sensor=pre_sensor,
             )
-            _save_rgb_to_png(rgb, n)
             _STEP["sim"] += 1
         except Exception as e:
             _log("SIM_ERR", err=repr(e))
@@ -714,6 +668,143 @@ def _patch_policy_cache():
     return True
 
 
+def _patch_pointnav_device():
+    """Force the internal PointNav sub-policy onto the same CUDA device as the
+    main torch actor.
+
+    Why this exists:
+      VLFM has several hardcoded `device="cuda"` literals that torch
+      resolves to cuda:0.  On a split-GPU layout (sim renderer on
+      cuda:0 / phys 4, torch actor on cuda:1 / phys 5 via
+      `habitat_baselines.torch_gpu_id=1`), the main actor tensors live
+      on cuda:1 but these literal-"cuda" tensors end up on cuda:0,
+      triggering:
+        "Expected all tensors to be on the same device, but found at
+         least two devices, cuda:1 and cuda:0!"
+      during the first explore-phase pointnav call.
+
+      Affected spots (read-only audit, NOT edited):
+        - WrappedPointNavResNetPolicy.__init__ default device="cuda"
+        - base_objectnav_policy._pointnav line 255  (masks tensor)
+        - base_objectnav_policy._pointnav line 264  (rho_theta tensor)
+
+    What this does:
+      1. Calls `torch.cuda.set_device(VLFM_POINTNAV_GPU_ID)` so that any
+         later `device="cuda"` literal resolves to the same physical GPU
+         as the main actor.  This fixes the two _pointnav literals
+         without touching vlfm/policy/.
+      2. Wraps `WrappedPointNavResNetPolicy.__init__` to pass a fully
+         specified `cuda:${VLFM_POINTNAV_GPU_ID}` device, belt-and-
+         suspenders in case set_device wasn't honored (e.g. trainer
+         flips it later).
+
+    Controlled by env var VLFM_POINTNAV_GPU_ID (default 1).  No change
+    to policy algorithm; this is pure device routing.
+    """
+    if "pointnav_device" in _TAPS_INSTALLED:
+        return False
+    mod = sys.modules.get("vlfm.policy.utils.pointnav_policy")
+    if mod is None:
+        return False
+    cls = getattr(mod, "WrappedPointNavResNetPolicy", None)
+    if cls is None:
+        return False
+    orig_init = cls.__init__
+    if getattr(orig_init, "_probe_patched", False):
+        _TAPS_INSTALLED.add("pointnav_device")
+        return True
+
+    target_gpu_id = int(os.environ.get("VLFM_POINTNAV_GPU_ID", "1"))
+
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() > target_gpu_id:
+            prev = torch.cuda.current_device()
+            torch.cuda.set_device(target_gpu_id)
+            _log(
+                "POINTNAV_SET_DEVICE",
+                prev_current=prev,
+                new_current=target_gpu_id,
+                device_count=torch.cuda.device_count(),
+            )
+    except Exception as e:
+        _log("POINTNAV_SET_DEVICE_ERR", err=repr(e))
+
+    def patched_init(self, ckpt_path, device="cuda", *a, **kw):
+        if isinstance(device, str) and device == "cuda":
+            device = f"cuda:{target_gpu_id}"
+            _log("POINTNAV_DEVICE_OVERRIDE", forced_to=device, ckpt=ckpt_path)
+        # set_device is per-thread; also force it inside the calling
+        # thread so any later `device="cuda"` literal in policy code that
+        # runs on the SAME thread resolves to the target GPU.
+        with contextlib.suppress(Exception):
+            torch.cuda.set_device(target_gpu_id)
+        return orig_init(self, ckpt_path, device=device, *a, **kw)
+
+    patched_init._probe_patched = True  # type: ignore[attr-defined]
+    cls.__init__ = patched_init
+    _TAPS_INSTALLED.add("pointnav_device")
+    _log("INSTALL", which="WrappedPointNavResNetPolicy.__init__")
+
+    # ---- also rebind move_obs_to_device to coerce ALL tensor inputs
+    # (not just numpy arrays) onto self.device.  This handles the
+    # `torch.tensor(..., device="cuda")` literals in
+    # base_objectnav_policy._pointnav (rho_theta_tensor) that produce
+    # cuda:0 tensors even when current_device is 1, because they ran on
+    # a different thread.
+    orig_move = getattr(mod, "move_obs_to_device", None)
+    if orig_move is not None and not getattr(orig_move, "_probe_patched", False):
+        import numpy as _np
+
+        def patched_move(observations, device, unsqueeze=False):
+            try:
+                import torch as _torch
+
+                for k, v in list(observations.items()):
+                    if isinstance(v, _np.ndarray):
+                        tdtype = _torch.uint8 if v.dtype == _np.uint8 else _torch.float32
+                        t = _torch.from_numpy(v).to(device=device, dtype=tdtype)
+                    elif isinstance(v, _torch.Tensor):
+                        if v.device != _torch.device(device):
+                            t = v.to(device=device)
+                        else:
+                            t = v
+                    else:
+                        continue
+                    if unsqueeze:
+                        t = t.unsqueeze(0)
+                    observations[k] = t
+            except Exception as e:
+                _log("MOVE_OBS_ERR", err=repr(e))
+            return observations
+
+        patched_move._probe_patched = True  # type: ignore[attr-defined]
+        mod.move_obs_to_device = patched_move
+        _log("INSTALL", which="pointnav_policy.move_obs_to_device")
+
+    # ---- wrap WrappedPointNavResNetPolicy.act so the `masks` Tensor is
+    # also forced onto self.device.  Same root cause: _pointnav creates
+    # masks with hardcoded device="cuda".
+    orig_act = cls.act
+    if not getattr(orig_act, "_probe_patched", False):
+
+        def patched_act(self, observations, masks, deterministic=False):
+            try:
+                import torch as _torch
+
+                if isinstance(masks, _torch.Tensor) and masks.device != self.device:
+                    masks = masks.to(self.device)
+            except Exception as e:
+                _log("MASKS_MOVE_ERR", err=repr(e))
+            return orig_act(self, observations, masks, deterministic=deterministic)
+
+        patched_act._probe_patched = True  # type: ignore[attr-defined]
+        cls.act = patched_act
+        _log("INSTALL", which="WrappedPointNavResNetPolicy.act")
+    return True
+
+
 # ---- patch loop --------------------------------------------------------
 def _try_patches() -> None:
     # All taps are independent — install whichever modules are present.
@@ -737,6 +828,8 @@ def _try_patches() -> None:
         _patch_transforms()
     with contextlib.suppress(Exception):
         _patch_policy_cache()
+    with contextlib.suppress(Exception):
+        _patch_pointnav_device()
 
 
 def _patch_loop() -> None:
@@ -749,7 +842,7 @@ def _patch_loop() -> None:
         if count != last_count:
             _log("INSTALL_STATUS", taps=str(sorted(_TAPS_INSTALLED)))
             last_count = count
-        if count >= 10:
+        if count >= 11:
             return
         time.sleep(0.2)
     _log("INSTALL_TIMEOUT", taps=str(sorted(_TAPS_INSTALLED)))
