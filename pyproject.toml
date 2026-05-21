@@ -35,7 +35,7 @@ dev = [
     "pytest-cov >= 4.0.0",
 ]
 habitat = [
-    "habitat-sim @ git+https://github.com/facebookresearch/habitat-sim.git@v0.2.4",
+    # habitat-sim: installed via conda (aihabitat 0.2.4 headless_bullet), not pip git clone
     "habitat-baselines == 0.2.420230405",
     "habitat-lab == 0.2.420230405",
 ]
