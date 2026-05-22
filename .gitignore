@@ -195,3 +195,15 @@ outputs/*
 !outputs/vlfm_itm_video_demo/
 !outputs/vlfm_itm_video_demo/*.png
 !outputs/vlfm_itm_video_demo/*.mp4
+
+# Runtime artifacts and downloaded weights / datasets that live inside the
+# repo dir for convenience but must never be committed.  Keep git status
+# quiet so real diffs stand out.
+/tb/
+/video_dir/
+/traced_model.pt
+/yolov7/
+/data/datasets/
+/data/scene_datasets/
+/data/*.pth
+/data/*.pt
