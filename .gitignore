@@ -187,12 +187,11 @@ GroundingDINO/
 __pycache__/
 *.pyc
 
-# Local experimental outputs - keep only curated probe/run scripts
-outputs/**/*.png
-outputs/**/__pycache__/
-outputs/2026-*/
-outputs/sim_only_logs/
-# Exception: keep the curated demo media under outputs/vlfm_itm_video_demo/
+# Local experimental outputs - by default ignore everything under outputs/
+# (probe logs, intermediate per-step frames, run logs from the split-GPU
+# launcher) except the curated demo media that documents the canonical
+# HabitatITMPolicyV2 split-GPU run.
+outputs/*
 !outputs/vlfm_itm_video_demo/
 !outputs/vlfm_itm_video_demo/*.png
 !outputs/vlfm_itm_video_demo/*.mp4
