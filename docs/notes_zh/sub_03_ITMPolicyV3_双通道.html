@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>子文档 03 · ITMPolicyV3 双通道 exploration_thresh 逻辑</title>
+<style>
+  :root {
+    --fg:#1f2328; --bg:#fff; --muted:#6e7781; --line:#d0d7de;
+    --code:#f6f8fa; --accent:#0969da; --warn:#bf8700; --good:#1a7f37; --bad:#cf222e;
+  }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+              font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  main { max-width: 1020px; margin: 24px auto 80px; padding: 0 18px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 28px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--line); }
+  h3 { font-size: 16px; margin: 18px 0 6px; color:#24292f; }
+  p, li { margin: 4px 0; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px;
+         font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace; font-size: 12.5px;}
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow:auto;
+        font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+        font-size: 12.5px; line-height:1.55; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 13px; }
+  th, td { border:1px solid var(--line); padding: 6px 9px; vertical-align: top; text-align:left; }
+  th { background:#f6f8fa; }
+  .muted { color: var(--muted); }
+  .callout { background:#ddf4ff; border-left:4px solid var(--accent); padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .warn   { background:#fff8c5; border-left:4px solid var(--warn);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .good   { background:#dafbe1; border-left:4px solid var(--good);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  svg { display:block; max-width:100%; height:auto; }
+  details summary { cursor:pointer; font-weight:600; margin:6px 0; }
+  .kv td:first-child { white-space:nowrap; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+
+<h1>子文档 03 · <code>ITMPolicyV3</code> 双通道 <code>exploration_thresh</code> 逻辑</h1>
+<p class="muted">配套：<a href="./数据链全景README.md">数据链全景 README</a> §3 / §4.3 / §4.7。
+本文专门拆 V3 比 V2 多出来的"两个 prompt + 一个阈值"那套机制——它在 HM3D 默认 yaml 里被关闭（<code>exploration_thresh=0</code>），
+但在论文消融、SemExp 复现、reality 配置里都会被打开，搞清楚它对调 hyper-param 很关键。</p>
+
+<div class="callout">
+  <b>一句话：</b>V3 用 <b>两个 prompt</b>（"目标 prompt" + "探索 prompt"）让 BLIP2-ITM 给每帧打两个余弦，
+  在 ValueMap 里以 <b>双通道</b> 累计；选 frontier 时检查"目标通道的全局最大值是否过 <code>exploration_thresh</code>"，
+  <b>过了就只看目标通道，没过就只看探索通道</b>。这是个二态切换，不是混合，也不是加权。
+</div>
+
+<h2>1. 类关系 / 默认配置一览</h2>
+<pre>
+BaseITMPolicy (itm_policy.py)
+├── ITMPolicy        (V1, FrontierMap，每个 frontier 缓存一次 cosine)
+├── ITMPolicyV2      (V2, 单通道 ValueMap, 每步全图 cosine)
+│    └── ITMPolicyV3 (V3, 双通道 ValueMap + exploration_thresh)
+│         └── HabitatITMPolicyV3 = HabitatMixin + ITMPolicyV3   (vlfm/policy/habitat_policies.py)
+</pre>
+
+<table class="kv">
+<thead><tr><th>项</th><th>HM3D 默认（V2）</th><th>开 V3 时的典型配置</th></tr></thead>
+<tbody>
+<tr><td>policy.name</td><td><code>HabitatITMPolicyV2</code></td><td><code>HabitatITMPolicyV3</code></td></tr>
+<tr><td>text_prompt</td><td><code>"Seems like there is a target_object ahead."</code></td>
+    <td><code>"Seems like there is a target_object ahead.|There is a lot of area to explore ahead."</code></td></tr>
+<tr><td>exploration_thresh</td><td><code>0.0</code></td><td>SemExp 论文用 <b>0.0007 ~ 0.0015</b>（见 <code>EXPLORATION_THRESH</code> 环境变量）</td></tr>
+<tr><td>ValueMap.value_channels</td><td>1</td><td>2</td></tr>
+<tr><td>BLIP2-ITM 每帧调用次数</td><td>1 次</td><td>2 次（每个 prompt 一次）</td></tr>
+</tbody>
+</table>
+
+<p>启用方式（SemExp 评测脚本 <code>vlfm/semexp_env/eval.py</code>）：</p>
+<pre>
+exp_thresh = float(os.environ.get("EXPLORATION_THRESH", 0.0))
+if exp_thresh > 0.0:
+    policy_cls = SemExpITMPolicyV3
+    policy_kwargs["exploration_thresh"] = exp_thresh
+    policy_kwargs["text_prompt"] = (
+        "Seems like there is a target_object ahead."
+        "|There is a lot of area to explore ahead."
+    )
+else:
+    policy_cls = SemExpITMPolicyV2
+</pre>
+
+<div class="warn">
+  <b>HM3D 默认就是 V2</b>。V3 的两个 prompt 用 <code>"|"</code>（<code>PROMPT_SEPARATOR</code>）拼接，
+  <code>ValueMap.__init__</code> 用 <code>len(text_prompt.split(PROMPT_SEPARATOR))</code> 决定通道数——
+  所以"是不是 V3"完全由 prompt 里有没有 <code>|</code> 决定，类名只是个壳。
+</div>
+
+<h2>2. 两 prompt 在数据链里的走向</h2>
+<svg viewBox="0 0 1000 360" role="img" aria-label="V3 dataflow">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .src { fill:#fff8c5; stroke:#bf8700; }
+      .vlm { fill:#ddf4ff; stroke:#0969da; }
+      .map { fill:#fde7f3; stroke:#bf3989; }
+      .dec { fill:#dafbe1; stroke:#1a7f37; }
+      .ar  { stroke:#1f2328; stroke-width:1.4; fill:none; marker-end:url(#arr); }
+      .lbl { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; text-anchor:middle; }
+      .sub { font: 11px ui-monospace,Menlo,monospace; fill:#6e7781; text-anchor:middle; }
+      .ch1 { stroke:#0969da; }
+      .ch2 { stroke:#bf3989; }
+    </style>
+  </defs>
+
+  <!-- rgb input -->
+  <rect class="src" x="10"  y="160" width="120" height="60" rx="6"/>
+  <text class="lbl" x="70" y="185">rgb (H,W,3)</text>
+  <text class="sub" x="70" y="205">value_map_rgbd[0]</text>
+
+  <!-- prompts -->
+  <rect class="src" x="160" y="70"  width="260" height="50" rx="6"/>
+  <text class="lbl" x="290" y="92">prompt₁ "...there is a chair ahead."</text>
+  <text class="sub" x="290" y="110">target prompt</text>
+
+  <rect class="src" x="160" y="260" width="260" height="50" rx="6"/>
+  <text class="lbl" x="290" y="282">prompt₂ "lot of area to explore ahead."</text>
+  <text class="sub" x="290" y="300">exploration prompt</text>
+
+  <!-- BLIP2 -->
+  <rect class="vlm" x="450" y="60"  width="170" height="70" rx="6"/>
+  <text class="lbl" x="535" y="85">BLIP2ITMClient.cosine</text>
+  <text class="sub" x="535" y="105">@ port 12182</text>
+  <text class="sub" x="535" y="120">→ cosine₁ ∈ [0,1]</text>
+
+  <rect class="vlm" x="450" y="250" width="170" height="70" rx="6"/>
+  <text class="lbl" x="535" y="275">BLIP2ITMClient.cosine</text>
+  <text class="sub" x="535" y="295">@ port 12182</text>
+  <text class="sub" x="535" y="310">→ cosine₂ ∈ [0,1]</text>
+
+  <!-- ValueMap channels -->
+  <rect class="map" x="660" y="60"  width="170" height="80" rx="6"/>
+  <text class="lbl" x="745" y="85">ValueMap._value_map</text>
+  <text class="sub" x="745" y="103">[:, :, 0]   "target value"</text>
+  <text class="sub" x="745" y="120">融合规则 = 锥形置信度加权</text>
+  <text class="sub" x="745" y="135">(同 V2)</text>
+
+  <rect class="map" x="660" y="240" width="170" height="80" rx="6"/>
+  <text class="lbl" x="745" y="265">ValueMap._value_map</text>
+  <text class="sub" x="745" y="283">[:, :, 1]   "exploration value"</text>
+  <text class="sub" x="745" y="300">共用 _map (置信度) 跟通道 1</text>
+
+  <!-- reduce -->
+  <rect class="dec" x="860" y="150" width="130" height="60" rx="6"/>
+  <text class="lbl" x="925" y="175">_reduce_values</text>
+  <text class="sub" x="925" y="195">按阈值二选一</text>
+
+  <!-- arrows -->
+  <path class="ar" d="M130,190 H160 V95  H160" />
+  <path class="ar" d="M160,95  H450"/>
+  <path class="ar" d="M130,190 H160 V285 H160"/>
+  <path class="ar" d="M160,285 H450"/>
+  <path class="ar" d="M620,95  H660" class="ch1"/>
+  <path class="ar" d="M620,285 H660" class="ch2"/>
+  <path class="ar" d="M830,100 H850 V180 H860" class="ch1"/>
+  <path class="ar" d="M830,280 H850 V180 H860" class="ch2"/>
+</svg>
+
+<p><b>读图重点</b>：</p>
+<ul>
+  <li>两个 prompt <b>共用同一张 RGB</b>，BLIP2-ITM 被调两次，得到 <code>cosines = (cosine₁, cosine₂)</code>。</li>
+  <li>它们一起调 <code>ValueMap.update_map(np.array(cosines), depth, tf, ...)</code>，
+      在每个通道里都按 <b>同一个锥形置信度 + 同一张 self._map（confidence）</b> 加权融合，
+      只是 <code>self._value_map[..., 0]</code> 累计 cosine₁，<code>self._value_map[..., 1]</code> 累计 cosine₂。</li>
+  <li><b>置信度只有一份</b>——这是 V3 在实现上最关键的细节：两个通道共享同一个 <code>self._map</code>（confidence），
+      因为它们对应的可见区/遮挡情况完全一样，权重也就一样。</li>
+</ul>
+
+<h2>3. <code>_reduce_values</code>：唯一一处真正用到 <code>exploration_thresh</code> 的地方</h2>
+
+<pre>
+# vlfm/policy/itm_policy.py · ITMPolicyV3
+def _sort_frontiers_by_value(self, observations, frontiers):
+    sorted_frontiers, sorted_values = self._value_map.sort_waypoints(
+        frontiers, radius=0.5, reduce_fn=self._reduce_values
+    )
+    return sorted_frontiers, sorted_values
+
+def _reduce_values(self, values: List[Tuple[float, float]]) -> List[float]:
+    """values 是每个 frontier 的 (target_value, exploration_value)。"""
+    target_values    = [v[0] for v in values]
+    max_target_value = max(target_values)
+    if max_target_value < self._exploration_thresh:
+        # 所有 frontier 的"目标价值"都太低 → 当前一帧也没看出目标在哪
+        # 退化为"找还没探索完的大区域"
+        return [v[1] for v in values]            # exploration_value
+    else:
+        # 至少一个 frontier 的目标价值 >= 阈值 → 信任 BLIP2 关于"目标在哪"的判断
+        return [v[0] for v in values]            # target_value
+</pre>
+
+<h3>3.1 决策树</h3>
+<svg viewBox="0 0 980 280" role="img" aria-label="V3 decision tree">
+  <defs>
+    <style>
+      .node { fill:#eef4ff; stroke:#0969da; }
+      .leafA{ fill:#dafbe1; stroke:#1a7f37; }
+      .leafB{ fill:#fff1e5; stroke:#bf8700; }
+      .br   { stroke:#1f2328; stroke-width:1.4; fill:none; marker-end:url(#arr); }
+      .lbl  { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; text-anchor:middle; }
+      .sub  { font: 11px ui-monospace,Menlo,monospace; fill:#6e7781; text-anchor:middle; }
+    </style>
+  </defs>
+
+  <rect class="node" x="380" y="10"  width="220" height="70" rx="6"/>
+  <text class="lbl" x="490" y="38">每个 frontier 取 (target, explore)</text>
+  <text class="sub" x="490" y="56">中位数(in 0.5 m radius)</text>
+  <text class="sub" x="490" y="72">→ values: List[(float,float)]</text>
+
+  <rect class="node" x="380" y="110" width="220" height="60" rx="6"/>
+  <text class="lbl" x="490" y="138">max(target_values)</text>
+  <text class="sub" x="490" y="156">vs self._exploration_thresh</text>
+
+  <rect class="leafA" x="60"  y="200" width="280" height="60" rx="6"/>
+  <text class="lbl" x="200" y="226">≥ threshold</text>
+  <text class="sub" x="200" y="248">→ 按 target_value 排序（"信目标"）</text>
+
+  <rect class="leafB" x="660" y="200" width="280" height="60" rx="6"/>
+  <text class="lbl" x="800" y="226">&lt; threshold</text>
+  <text class="sub" x="800" y="248">→ 按 explore_value 排序（"找空地"）</text>
+
+  <path class="br" d="M490,80  V110"/>
+  <path class="br" d="M460,170 V190 H200 V200"/>
+  <path class="br" d="M520,170 V190 H800 V200"/>
+</svg>
+
+<div class="warn">
+  这是个 <b>硬切换</b>，不是混合。所以 <code>exploration_thresh</code> 调过头会出现：
+  本帧 target_value max 是 0.0008，恰好越过 0.0007 阈值，整个排序立刻翻转——
+  上一帧选的 frontier 突然从 "高 explore" 变成 "低 target"，PointNav 目标骤变，hidden 被 reset（详见
+  <a href="./sub_01_PointNav_ResNet内部.html">PointNav 子文档</a> §4）。所以阈值要尽量挑在 BLIP2 cosine 的<b>双峰之间</b>。
+</div>
+
+<h3>3.2 <code>exploration_thresh = 0</code> 时</h3>
+<pre>
+max_target_value < 0   →  False           # 因为 cosine ≥ 0
+所以永远走 if-else 的 else 分支          → 按 target_value 排
+</pre>
+<p><b>结论</b>：V3 + <code>thresh=0</code> 退化为 V2，但 BLIP2 多算一次（白费算力）；除非你要做消融，否则别这么设。</p>
+
+<h3>3.3 <code>exploration_thresh = 1.0</code> 时</h3>
+<p>BLIP2 cosine 极少 ≥ 1，所以几乎永远走 <code>if</code> 分支——退化为 "frontier 永远按 explore prompt 排序"。
+这跟 frontier-based exploration（FBE）的行为很接近，只是 explore 通道是 BLIP2 给的"是不是宽阔区域"评分，
+而不是纯几何距离/面积。</p>
+
+<h2>4. 可视化（<code>visualize_value_map</code>）</h2>
+<p>V3 改写了基类的 <code>_vis_reduce_fn</code>：</p>
+<pre>
+def visualize_value_map(arr):                  # arr: (1000,1000,2)
+    first_channel = arr[:, :, 0]
+    max_values    = np.max(arr, axis=2)
+    mask          = first_channel > exploration_thresh
+    return np.where(mask, first_channel, max_values)
+</pre>
+<p>语义：</p>
+<ul>
+  <li>对每个像素单独判断"目标通道是否过阈值"——过了显示目标通道，没过显示两通道最大值。</li>
+  <li>注意这是<b>像素级</b>判断，但 <code>_reduce_values</code> 是<b>frontier-集合-级</b>判断（全局 max），两者口径不同，
+      所以你看可视化"红的地方多"不等于实际排序用的就是目标通道。</li>
+</ul>
+
+<h2>5. ValueMap 内部的双通道融合（再确认一遍）</h2>
+<p>看 <code>vlfm/mapping/value_map.py · _fuse_new_data</code>：</p>
+<pre>
+# 默认 use_max_confidence=False 时：
+weight_1 = self._map / (self._map + new_map)            # (H,W)
+weight_2 = new_map   / (self._map + new_map)            # (H,W)
+self._value_map = self._value_map * weight_1[..., None] + values * weight_2[..., None]
+                                                        # ↑ weight 广播到所有通道
+self._map       = self._map       * weight_1            + new_map * weight_2
+</pre>
+
+<p><b>关键观察</b>：</p>
+<ol>
+  <li>权重张量 <code>weight_1/weight_2</code> 是 (H,W)，<code>values</code> 是 (C,) 标量；
+      <code>* weight_2[..., None]</code> 把权重广播到所有通道，所以 <b>两通道用完全相同的权重做加权平均</b>。</li>
+  <li>新值 <code>values = (cosine₁, cosine₂)</code>在锥形可见区内是常数标量（不随像素变）——这是 BLIP2 给整张图的一个分数，
+      它的"空间结构"完全来自<code>new_map</code>这张置信度锥形 mask，而不是这两个值本身。</li>
+  <li><code>sort_waypoints(radius=0.5)</code> 在每个 frontier 周围 0.5 m 半径内取的是<b>中位数</b>（<code>pixel_value_within_radius</code>），
+      所以对噪声很 robust，但也意味着阈值要按"中位数"标准来调，不能按 BLIP2 单次输出的均值/max。</li>
+</ol>
+
+<h2>6. 怎么挑 <code>exploration_thresh</code></h2>
+<ol>
+  <li>先开 V2 默认跑几条 episode，把 <code>BLIP2ITMClient.cosine</code> 的返回值打 log，画直方图。
+      HM3D chair 任务大约会看到 cosine 集中在 0.0003-0.0015，目标真的在视野内时 spike 到 0.002-0.005。</li>
+  <li>挑两个峰之间的"谷"——一般 <code>exploration_thresh ≈ 0.0007</code> 就是这种数量级（注意它在 BLIP2 ITM 头里实际是
+      未做 sigmoid 的 logits 量级，所以看着远小于 1）。</li>
+  <li>同时拿 SPL 当 sanity check：阈值偏低 → 频繁切回探索，SPL 涨；偏高 → 经常硬切，PointNav 晃悠，SPL 跌。</li>
+  <li><b>不要</b>跨数据集复用阈值。HM3D / MP3D / Reality 各 prompt 长度/类别多样性都不同，cosine 分布会偏。</li>
+</ol>
+
+<h2>7. V3 的失败模式（trace 时常见）</h2>
+<table>
+<thead><tr><th>现象</th><th>可能原因</th><th>排查点</th></tr></thead>
+<tbody>
+<tr>
+  <td>BLIP2 双 prompt 一直爆 timeout</td>
+  <td>每帧 2 次 HTTP，VLM 服务被打爆</td>
+  <td><code>vlfm/vlm/server_wrapper.py</code> 重试次数 / 看 12182 端口 QPS</td>
+</tr>
+<tr>
+  <td>ValueMap 视觉看着 OK 但 frontier 选错</td>
+  <td>"frontier 排序用的是另一个通道"——回看 §3.1 决策树</td>
+  <td>打印 <code>max(target_values)</code> 和 <code>self._exploration_thresh</code></td>
+</tr>
+<tr>
+  <td>切换抖动，每隔几步换 frontier</td>
+  <td><code>max_target</code> 反复在阈值附近震荡</td>
+  <td>加个迟滞：阈值上下加 ±10% 死区，或者沿用 last_value 偏置</td>
+</tr>
+<tr>
+  <td>Reality 配置下 cosine 全是 0</td>
+  <td>prompt 拼接漏写了 <code>"|"</code>，<code>value_channels=1</code> 但 V3 还期望 tuple</td>
+  <td><code>print(self._value_map.shape)</code>，看是不是 (size,size,1)；assert 通道数</td>
+</tr>
+</tbody>
+</table>
+
+<h2>8. trace 一帧时的断点</h2>
+<ol>
+  <li><code>vlfm/policy/itm_policy.py · ITMPolicyV2._update_value_map</code>
+      （V3 继承自 V2 没重写）→ 打印 <code>cosines</code>，确认拿到的是 list[list[float, float]]，外层长度 1（HM3D 单相机），内层长度 2。</li>
+  <li><code>vlfm/mapping/value_map.py · update_map</code> → 在 <code>_fuse_new_data</code> 入口
+      <code>print(values, values.shape)</code>，确认 <code>(2,) float32</code>。</li>
+  <li><code>vlfm/policy/itm_policy.py · ITMPolicyV3._reduce_values</code> → 打印 <code>max_target_value</code> 跟阈值的相对关系，
+      以及最后返回的是哪个通道的列表。</li>
+  <li>对照 <code>BaseITMPolicy._get_best_frontier</code> 的 <code>top_two_values</code> 元组，
+      它会被 <code>AcyclicEnforcer</code> 用做"状态-动作"哈希；通道切换会导致 hash 突变，绕过 cyclic 抑制——
+      所以阈值附近来回跳时容易陷入"原本应该 suppressed 的 frontier 又被允许"。</li>
+</ol>
+
+<h2>9. 跟论文的对应</h2>
+<p>VLFM 论文 (Yokoyama et al., 2024) Sec. 4.3 提到 V3 的两个 prompt 是为了
+<b>解耦"目标价值"和"探索价值"</b>，避免单 prompt 在屋子完全没目标时也强行给出方向偏好。
+论文实验里阈值是经验调的，作者代码里更普遍的写法是把 <code>exploration_thresh</code> 当环境变量传，方便扫参。</p>
+
+<div class="good">
+  <b>记住</b>：HM3D 默认 V2，所以你直接跑下来 ValueMap 是单通道，<code>_reduce_values</code> 根本不会被调用。
+  想体验 V3 改两处：① 把 yaml 里的 policy name 换成 <code>HabitatITMPolicyV3</code>；
+  ② 把 <code>text_prompt</code> 改成带 <code>|</code> 的双 prompt，并设 <code>exploration_thresh &gt; 0</code>。
+</div>
+
+<p class="muted">↩ 回到 <a href="./数据链全景README.md">数据链全景 README</a> · 同级子文档：
+   <a href="./sub_01_PointNav_ResNet内部.html">PointNav ResNet</a> ·
+   <a href="./sub_02_fog_of_war算法.html">fog_of_war 算法</a></p>
+
+</main>
+</body>
+</html>

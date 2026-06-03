@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>子文档 02 · fog_of_war 算法细节（reveal_fog_of_war）</title>
+<style>
+  :root {
+    --fg:#1f2328; --bg:#fff; --muted:#6e7781; --line:#d0d7de;
+    --code:#f6f8fa; --accent:#0969da; --warn:#bf8700; --good:#1a7f37;
+  }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+              font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  main { max-width: 1020px; margin: 24px auto 80px; padding: 0 18px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 28px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--line); }
+  h3 { font-size: 16px; margin: 18px 0 6px; color:#24292f; }
+  p, li { margin: 4px 0; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px;
+         font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace; font-size: 12.5px;}
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow:auto;
+        font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+        font-size: 12.5px; line-height:1.55; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 13px; }
+  th, td { border:1px solid var(--line); padding: 6px 9px; vertical-align: top; text-align:left; }
+  th { background:#f6f8fa; }
+  .muted { color: var(--muted); }
+  .callout { background:#ddf4ff; border-left:4px solid var(--accent); padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .warn   { background:#fff8c5; border-left:4px solid var(--warn);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .good   { background:#dafbe1; border-left:4px solid var(--good);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:flex-start; }
+  .row > figure { flex:1 1 240px; margin:0; }
+  figure svg { width:100%; height:auto; background:#fbfcfe; border:1px solid var(--line); border-radius:6px; }
+  figcaption { font-size:12px; color:var(--muted); text-align:center; margin-top:4px; }
+  svg.flow { width:100%; height:auto; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>子文档 02 · <code>reveal_fog_of_war</code> 算法细节</h1>
+<p class="muted">配套：<a href="./数据链全景README.md">数据链全景 README</a> §4.2 第 9 步。本文专门拆 <code>frontier_exploration.utils.fog_of_war.reveal_fog_of_war</code>，
+它是 <code>ObstacleMap.update_map</code> 里把"扇形 FOV 锥被障碍物切掉之后还可见的那一块"标到 <code>explored_area</code> 的核心算子。</p>
+
+<div class="callout">
+  <b>一句话：</b>它不是普通的"光栅 ray casting 一根一根射线"，而是
+  <b>"画扇形 → 用 obstacle 把扇形撕碎 → 取含 agent 的那块多边形"</b>，用 <b>OpenCV 的 ellipse / polylines / findContours</b> 几步就完事。
+  速度优势：500 次平均 ~几 ms 量级（脚本末尾自带 benchmark），比逐根射线快一两个数量级。
+</div>
+
+<h2>1. 入参 / 出参</h2>
+<pre>
+def reveal_fog_of_war(
+    top_down_map:              np.ndarray,  # (H, W) uint8, 1=可航行(free), 0=障碍/未知
+    current_fog_of_war_mask:   np.ndarray,  # (H, W) uint8, 历史 fog（VLFM 这里每帧传 zeros，再在外面 OR 上去）
+    current_point:             np.ndarray,  # (2,) int, agent 像素 (row, col)
+    current_angle:             float,       # 弧度
+    fov: float = 90,                        # 角度!（注意是度，不是弧度）
+    max_line_len: float = 100,              # 像素
+    enable_debug_visualization: bool = False,
+) -> np.ndarray                            # (H, W) uint8, 0/1，新可见区
+</pre>
+
+<table>
+<thead><tr><th>VLFM 里实际怎么传</th><th>值</th></tr></thead>
+<tbody>
+<tr><td><code>top_down_map</code></td><td><code>self._navigable_map.astype(uint8)</code>（True=可走）</td></tr>
+<tr><td><code>current_fog_of_war_mask</code></td><td><code>np.zeros_like(self._map, uint8)</code>（每帧重算，再 OR 到 <code>self.explored_area</code>）</td></tr>
+<tr><td><code>current_point</code></td><td><code>agent_pixel_location[::-1]</code>（注意 [::-1]，从 (x,y) 翻成 (row,col)）</td></tr>
+<tr><td><code>current_angle</code></td><td><code>-extract_yaw(tf_camera_to_episodic)</code>（取负，因为像素 y 朝下）</td></tr>
+<tr><td><code>fov</code></td><td><code>np.rad2deg(topdown_fov) = 79°</code>（HM3D）</td></tr>
+<tr><td><code>max_line_len</code></td><td><code>max_depth * pixels_per_meter = 5·20 = 100 px</code></td></tr>
+</tbody>
+</table>
+
+<h2>2. 算法 5 步走（配 SVG 图）</h2>
+
+<svg class="flow" viewBox="0 0 980 220" role="img" aria-label="fog_of_war steps overview">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .nd { fill:#eef4ff; stroke:#0969da; stroke-width:1; }
+      .lbl { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; text-anchor:middle; }
+      .sub { font: 11px ui-monospace,Menlo,monospace; fill:#6e7781; text-anchor:middle; }
+      .ar  { stroke:#1f2328; stroke-width:1.4; fill:none; marker-end:url(#arr); }
+    </style>
+  </defs>
+  <rect class="nd" x="10"   y="80" width="160" height="60" rx="6"/>
+  <text class="lbl" x="90" y="105">① 画扇形 cone</text>
+  <text class="sub" x="90" y="125">cv2.ellipse(...,fov)</text>
+
+  <rect class="nd" x="195"  y="80" width="170" height="60" rx="6"/>
+  <text class="lbl" x="280" y="105">② 找扇内障碍 contour</text>
+  <text class="sub" x="280" y="125">cone ∧ ¬free</text>
+
+  <rect class="nd" x="390"  y="80" width="190" height="60" rx="6"/>
+  <text class="lbl" x="485" y="105">③ 取每个障碍最外两条切线点</text>
+  <text class="sub" x="485" y="125">按 agent_yaw 旋转后取最小/最大角</text>
+
+  <rect class="nd" x="605"  y="80" width="180" height="60" rx="6"/>
+  <text class="lbl" x="695" y="105">④ 用切线撕碎扇形</text>
+  <text class="sub" x="695" y="125">cv2.polylines(color=0, t=2)</text>
+
+  <rect class="nd" x="810"  y="80" width="160" height="60" rx="6"/>
+  <text class="lbl" x="890" y="105">⑤ 取含 agent 的那块</text>
+  <text class="sub" x="890" y="125">findContours+pointPolyTest</text>
+
+  <path class="ar" d="M170,110 H195"/>
+  <path class="ar" d="M365,110 H390"/>
+  <path class="ar" d="M580,110 H605"/>
+  <path class="ar" d="M785,110 H810"/>
+</svg>
+
+<h3>2.1 第 ① 步：把扇形画成一个 mask</h3>
+<pre>
+curr_pt_cv2 = current_point[::-1].astype(int)          # 翻成 (col, row) 给 cv2 用
+angle_cv2   = rad2deg(wrap_heading(-current_angle + pi/2))  # 转成 cv2 ellipse 期望的"x 轴正方向起算"
+cone_mask = cv2.ellipse(
+    zeros_like(top_down_map),
+    curr_pt_cv2,
+    (int(max_line_len), int(max_line_len)),   # 半径 a=b ⇒ 圆扇
+    0,
+    angle_cv2 - fov/2,
+    angle_cv2 + fov/2,
+    color=1,
+    thickness=-1,                              # 填充
+)
+</pre>
+<p>关键坐标变换：</p>
+<ul>
+  <li><b>numpy 跟 cv2 的 (row,col) vs (x,y) 反着</b>：所以 <code>current_point[::-1]</code>。</li>
+  <li><b>角度反向 + π/2 校准</b>：episodic 坐标系 yaw 是"逆时针，x 向右"；cv2 ellipse 的 startAngle 是
+      "顺时针，x 轴正方向起算"；<code>-yaw + π/2</code> 就是把它转过来。</li>
+  <li><b><code>wrap_heading</code></b>：把角度归到 (-π, π]，避免 ellipse 的 start/end 跨 360° 出 bug。</li>
+</ul>
+
+<h3>2.2 第 ② 步：扇形 ∩ 障碍</h3>
+<pre>
+obstacles_in_cone = cv2.bitwise_and(cone_mask, 1 - top_down_map)   # 1=扇内且不可走
+obstacle_contours, _ = cv2.findContours(obstacles_in_cone, RETR_TREE, CHAIN_APPROX_SIMPLE)
+</pre>
+<p>这里每一个 contour 都是"扇形内会挡住视线的一坨障碍物轮廓"。如果一个都没有 → 直接返回原 fog（说明前方畅通）。</p>
+
+<h3>2.3 第 ③ 步：每个障碍取最外两条切线（关键创新）</h3>
+<svg viewBox="0 0 460 260" role="img" aria-label="two farthest points">
+  <defs>
+    <style>
+      .agent{ fill:#0969da; }
+      .obs  { fill:#bf8700; stroke:#7d4e00; stroke-width:1; }
+      .ray  { stroke:#1a7f37; stroke-width:1.6; fill:none; stroke-dasharray:4 3; }
+      .pt   { fill:#1a7f37; }
+      .ax   { stroke:#d0d7de; stroke-width:1; fill:none; }
+      .lbl  { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; }
+      .sub  { font: 11px ui-monospace,Menlo,monospace; fill:#6e7781; }
+    </style>
+  </defs>
+  <!-- arc / cone -->
+  <path d="M 60 200 L 430 80 A 380 380 0 0 0 430 320 Z" fill="#ddf4ff" stroke="#0969da" opacity="0.5"/>
+  <!-- agent -->
+  <circle class="agent" cx="60" cy="200" r="6"/>
+  <text class="lbl" x="14" y="220">agent</text>
+  <!-- obstacle polygon -->
+  <polygon class="obs" points="220,150 310,140 320,200 250,210 210,180"/>
+  <!-- two tangent rays to obstacle extremes -->
+  <line class="ray" x1="60" y1="200" x2="430" y2="80"/>   <!-- mistakenly extended; we'll mark the chosen pts -->
+  <line class="ray" x1="60" y1="200" x2="430" y2="222"/>
+  <circle class="pt" cx="220" cy="150" r="5"/>
+  <circle class="pt" cx="320" cy="200" r="5"/>
+  <text class="sub" x="200" y="140">pt1 (min angle)</text>
+  <text class="sub" x="330" y="200">pt2 (max angle)</text>
+
+  <text class="lbl" x="170" y="40">把所有 contour 点减去 agent，绕 -agent_yaw 旋转，</text>
+  <text class="lbl" x="170" y="58">再算 atan2(y, x)。argmin 和 argmax 就是两条切线落脚点。</text>
+</svg>
+
+<pre>
+def get_two_farthest_points(source, cnt, agent_yaw):
+    pts = cnt.reshape(-1, 2) - source                 # (M, 2) 相对 agent
+    R = [[cos(-agent_yaw), -sin(-agent_yaw)],
+         [sin(-agent_yaw),  cos(-agent_yaw)]]
+    pts = pts @ R                                     # 把 agent 朝向旋到 x 轴
+    angles = arctan2(pts[:,1], pts[:,0])              # (-pi, pi]
+    return cnt[argmin(angles)], cnt[argmax(angles)]   # 最左最右两条切线
+</pre>
+
+<div class="warn">
+  <b>fallback</b>：只有 <code>cv2.isContourConvex(cnt) == True</code> 时才用这一招省事；
+  非凸轮廓（典型：墙转角的 L 型）直接 <code>points.append(cnt)</code>，把整个轮廓的所有点都丢进去
+  ——后面靠 polylines 切碎以后再让 findContours 把"被障碍挡住的扇形碎片"合并。
+</div>
+
+<h3>2.4 第 ④ 步：用切线把扇形撕碎</h3>
+<pre>
+visible_cone_mask = cv2.bitwise_and(cone_mask, top_down_map)   # 扇内且可走 = candidate
+line_points = vectorize_get_line_points(curr_pt_cv2, points, max_line_len * 1.05)
+# 每个点对 (start_point, end_point) 形成一条线段：从该 obstacle 顶点出发，沿 agent→该点 的方向延长 105%
+cv2.polylines(visible_cone_mask, line_points, isClosed=False, color=0, thickness=2)
+</pre>
+
+<svg viewBox="0 0 980 230" role="img" aria-label="fog of war split">
+  <defs>
+    <style>
+      .free { fill:#ffffff; stroke:#d0d7de; }
+      .wall { fill:#404040; stroke:none; }
+      .cone { fill:#ddf4ff; opacity:0.6; stroke:#0969da; }
+      .agent{ fill:#0969da; }
+      .cut  { stroke:#cf222e; stroke-width:2; }
+      .keep { fill:#dafbe1; stroke:#1a7f37; }
+      .lbl  { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; text-anchor:middle; }
+    </style>
+  </defs>
+
+  <!-- panel A: cone only -->
+  <g transform="translate(0,0)">
+    <rect class="free" x="10" y="20" width="300" height="200"/>
+    <text class="lbl" x="160" y="14">A. cone ∧ free（原始候选）</text>
+    <path class="cone" d="M 160 130 L 290 60 A 150 150 0 0 0 290 200 Z"/>
+    <rect class="wall" x="200" y="110" width="50" height="20"/>
+    <rect class="wall" x="245" y="150" width="35" height="25"/>
+    <circle class="agent" cx="160" cy="130" r="5"/>
+  </g>
+
+  <!-- panel B: with cut lines -->
+  <g transform="translate(330,0)">
+    <rect class="free" x="10" y="20" width="300" height="200"/>
+    <text class="lbl" x="160" y="14">B. 从障碍两侧画切线</text>
+    <path class="cone" d="M 160 130 L 290 60 A 150 150 0 0 0 290 200 Z"/>
+    <rect class="wall" x="200" y="110" width="50" height="20"/>
+    <rect class="wall" x="245" y="150" width="35" height="25"/>
+    <circle class="agent" cx="160" cy="130" r="5"/>
+    <line class="cut" x1="160" y1="130" x2="296" y2="40"/>
+    <line class="cut" x1="160" y1="130" x2="296" y2="160"/>
+    <line class="cut" x1="160" y1="130" x2="296" y2="120"/>
+    <line class="cut" x1="160" y1="130" x2="296" y2="210"/>
+  </g>
+
+  <!-- panel C: kept polygon -->
+  <g transform="translate(660,0)">
+    <rect class="free" x="10" y="20" width="300" height="200"/>
+    <text class="lbl" x="160" y="14">C. 取含 agent 的那块作为可见</text>
+    <path class="keep" d="M 160 130 L 200 110 L 200 130 L 245 150 L 245 175 L 215 200 L 50 200 Z" opacity="0.3"/>
+    <rect class="wall" x="200" y="110" width="50" height="20"/>
+    <rect class="wall" x="245" y="150" width="35" height="25"/>
+    <circle class="agent" cx="160" cy="130" r="5"/>
+  </g>
+</svg>
+
+<p><b>为什么 <code>thickness=2</code> 而不是 1？</b>因为 <code>findContours</code> 要靠这条线把多边形断开，1px 容易因为浮点抖动留个缝，导致两个本该独立的区域被串成同一个，最后 pointPolygonTest 取错。</p>
+
+<h3>2.5 第 ⑤ 步：取含 agent 的那块多边形</h3>
+<pre>
+final_contours, _ = cv2.findContours(visible_cone_mask, RETR_TREE, CHAIN_APPROX_SIMPLE)
+visible_area, min_dist = None, inf
+for cnt in final_contours:
+    dist = abs(cv2.pointPolygonTest(cnt, agent_pixel, measureDist=True))
+    if dist < min_dist:
+        min_dist, visible_area = dist, cnt
+
+if min_dist > 3:
+    return current_fog_of_war_mask   # 离最近 contour 都超 3 px，认为出错了，跳过本帧
+new_fog = cv2.drawContours(current_fog_of_war_mask, [visible_area], 0, 1, -1)
+return new_fog
+</pre>
+
+<ul>
+  <li><b><code>pointPolygonTest(..., True)</code></b> 返回带符号距离：正=点在内，负=点在外，0=点在边上。这里取 abs 后比大小，
+      因为 agent 像素有时候因为四舍五入会刚好落到 1px 厚的边线上变负。</li>
+  <li><b><code>min_dist &gt; 3</code> 直接放弃这一帧</b>：典型场景是 agent 站到了 obstacle 边缘里，所有 contour 都离它老远，
+      这时候宁可不更新，也不要把错误的可见区染进 explored_area。</li>
+</ul>
+
+<h2>3. ObstacleMap 这一层的额外加工（VLFM 自己加的）</h2>
+<p><code>vlfm/mapping/obstacle_map.py · update_map</code> 拿到 <code>reveal_fog_of_war</code> 返回值之后还有 3 步：</p>
+
+<pre>
+new_explored_area = cv2.dilate(new_explored_area, np.ones((3,3), uint8), iterations=1)   # ① 放大一点
+self.explored_area[new_explored_area > 0] = 1                                            # ② OR 累计
+self.explored_area[self._navigable_map == 0] = 0                                         # ③ 障碍区强制清掉
+
+contours, _ = cv2.findContours(self.explored_area, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE)
+if len(contours) > 1:
+    # 取含 agent 的连通块（如果 agent 不在任何块内就取离它最近的那块）
+    ...
+    self.explored_area = new_area.astype(bool)
+</pre>
+
+<table>
+<thead><tr><th>步骤</th><th>目的</th></tr></thead>
+<tbody>
+<tr><td>① dilate 3×3</td><td>视觉上让相邻帧的可见区"咬"起来，避免几帧之间出现 1 px 缝（看起来像没探索过）</td></tr>
+<tr><td>② OR 累计</td><td>fog-of-war 是单调递增的：见过的地方永远算见过</td></tr>
+<tr><td>③ 障碍清零</td><td>第 ① 步 dilate 会侵犯到 obstacle 里，这里把 dilation 溢出的部分扣回去</td></tr>
+<tr><td>含 agent 连通块过滤</td><td>避免"在 A 房间穿过门 → 门外被错误标成已探索"的孤岛，比如 reveal_fog_of_war 在房屋之间打穿一条缝</td></tr>
+</tbody>
+</table>
+
+<h2>4. 关键参数对最终 frontier 的影响</h2>
+<table>
+<thead><tr><th>参数</th><th>默认（HM3D）</th><th>调大会怎样</th><th>调小会怎样</th></tr></thead>
+<tbody>
+<tr><td><code>topdown_fov</code></td><td>79°（=camera_fov）</td><td>探索区椭圆张得更开，frontier 退得更远；但容易把侧后方未观测区误判成已见</td>
+    <td>更保守，每步可见区窄一条带，frontier 集中在正前方</td></tr>
+<tr><td><code>max_depth</code></td><td>5 m ⇒ <code>max_line_len=100 px</code></td><td>看得更远，远距离 frontier 提前消失；但 BLIP2 锥也跟着延长，会有空想价值</td>
+    <td>探索区只在 1-2 m 内增长，frontier 紧贴 agent，循环 frontier 更频繁</td></tr>
+<tr><td>射线 thickness</td><td>2 px</td><td>切得更狠，碎片更多，可能漏掉细长走廊</td><td>1 px 容易粘连，对面房间会被误判可见</td></tr>
+<tr><td>step 末尾 dilate kernel</td><td>3×3</td><td>边界更平滑，但 explored_area 会"流"过 obstacle</td><td>边界破碎，frontier 会探测到伪边界</td></tr>
+</tbody>
+</table>
+
+<h2>5. 跟 frontier 检测的衔接</h2>
+<p><code>_get_frontiers</code> 再把这张已探索图 dilate 一次（5×5），交给
+<code>frontier_exploration.frontier_detection.detect_frontier_waypoints(navigable, explored, area_thresh)</code>：</p>
+
+<pre>
+explored_area_dilated = cv2.dilate(explored_area, 5x5)
+frontiers_px = detect_frontier_waypoints(navigable_map, explored_area_dilated, area_thresh_in_pixels)
+frontiers    = self._px_to_xy(frontiers_px)
+</pre>
+
+<p>这一步等价于：</p>
+<ol>
+  <li>找 <code>navigable ∩ ¬explored</code> 的轮廓 → "可走但没见过的"边界；</li>
+  <li>面积小于 <code>area_thresh</code>（默认 1.5 m² = 600 px²）的过滤掉，避免噪点；</li>
+  <li>每个轮廓上取若干"代表点"（中点 + 弯折点）作为 waypoint。</li>
+</ol>
+
+<div class="good">
+  <b>因此，fog_of_war 的精度直接决定 frontier 的数量和位置</b>：
+  探得太保守 → 处处是 frontier，策略乱跳；
+  探得太激进 → frontier 集中到很远的边角，PointNav 走到一半发现根本不可达，被 acyclic enforcer 屏蔽。
+  调过 HM3D 默认参数后，每步典型 frontier 数 0-4 个。
+</div>
+
+<h2>6. 自己跑算法 demo</h2>
+<p>原文件 <code>vendor/frontier_exploration/frontier_exploration/utils/fog_of_war.py</code> 末尾自带可视化 main：</p>
+<pre>
+python -m frontier_exploration.utils.fog_of_war
+# 随机生成 1000×1000 的房间 + 100 个矩形障碍，agent 随机位置/朝向；
+# 每次按任意键展示中间四步（cone / obstacles / lines / final），按 q 退出。
+</pre>
+<p>把 <code>SHOW=False</code> 关掉再跑会打印 500 次的平均时间，本机一般 1-3 ms。</p>
+
+<h2>7. trace 一帧时的断点</h2>
+<ol>
+  <li><code>vlfm/mapping/obstacle_map.py · update_map</code> 第 117 行前后，
+      <code>print(agent_pixel_location, np.rad2deg(topdown_fov), max_depth*pixels_per_meter)</code>。</li>
+  <li>在 <code>reveal_fog_of_war</code> 末尾把
+      <code>enable_debug_visualization=True</code>，OpenCV 会逐步 imshow 出 cone / obstacles / lines / final 四张图。</li>
+  <li>对比 <code>self.explored_area</code> 前后差，可以用
+      <code>cv2.imwrite("diff.png", (new_explored_area.astype(uint8) - prev)*255)</code> 直观看新增了哪一块。</li>
+</ol>
+
+<p class="muted">↩ 回到 <a href="./数据链全景README.md">数据链全景 README</a> · 同级子文档：
+   <a href="./sub_01_PointNav_ResNet内部.html">PointNav ResNet</a> ·
+   <a href="./sub_03_ITMPolicyV3_双通道.html">ITMPolicyV3 双通道</a></p>
+
+</main>
+</body>
+</html>

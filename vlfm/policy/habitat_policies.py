@@ -25,7 +25,19 @@ from ..mapping.obstacle_map import ObstacleMap
 from .base_objectnav_policy import BaseObjectNavPolicy, VLFMConfig
 from .itm_policy import ITMPolicy, ITMPolicyV2, ITMPolicyV3
 
-HM3D_ID_TO_NAME = ["chair", "bed", "potted plant", "toilet", "tv", "couch"]
+HM3D_ID_TO_NAME = [
+    "chair",          # 0  (chair)
+    "bed",            # 1  (bed)
+    "potted plant",   # 2  (plant)
+    "toilet",         # 3  (toilet)
+    "tv",             # 4  (tv_monitor)
+    "couch",          # 5  (sofa)
+    "cat",            # 6  ← new
+    "dog",            # 7  ← new
+    "vase",           # 8  ← new
+    "bottle",         # 9  ← new
+    "tennis racket",  # 10 ← new
+]
 MP3D_ID_TO_NAME = [
     "chair",
     "table|dining table|coffee table|side table|desk",  # "table",

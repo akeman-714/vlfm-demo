@@ -54,6 +54,14 @@ LOG="${LOG:-outputs/vlfm_itm_split_gpu.log}"
 TIMEOUT_S="${TIMEOUT_S:-2100}"
 N_EPISODES="${N_EPISODES:-1}"
 SPLIT="${SPLIT:-val}"
+# Optional comma-separated list of scene base names to restrict the dataset to
+# (e.g. CONTENT_SCENES="4ok3usBNeis,5cdEh9F2hJL").  Empty => use all scenes.
+CONTENT_SCENES="${CONTENT_SCENES:-}"
+# Optional comma-separated list of global episode indices to restrict the run to
+# (e.g. EPISODE_IDS="18,23,26,85").  Empty => use all episodes in the scene.
+# When set, N_EPISODES is automatically clamped to the count of IDs if not
+# already provided by the caller.
+EPISODE_IDS="${EPISODE_IDS:-}"
 
 mkdir -p "${VIDEO_DIR}" "${TB_DIR}" "$(dirname "${LOG}")"
 
@@ -63,6 +71,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}  (sim=cuda:0, torch=cuda:1)"
 echo "VLM ports: GDINO=${GROUNDING_DINO_PORT} BLIP2=${BLIP2ITM_PORT} SAM=${SAM_PORT} YOLOv7=${YOLOV7_PORT}"
 echo "video dir: ${VIDEO_DIR}/   tb dir: ${TB_DIR}/   log: ${LOG}"
 echo "timeout: ${TIMEOUT_S}s   episodes: ${N_EPISODES}   split: ${SPLIT}"
+echo "scenes: ${CONTENT_SCENES:-<all>}"
 echo "-- pre-flight GPU usage (sim+torch GPUs must be near-empty) --"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | head -10
 echo "-- VLM health probes --"
@@ -75,6 +84,23 @@ for p in "${GROUNDING_DINO_PORT}" "${BLIP2ITM_PORT}" "${SAM_PORT}" "${YOLOV7_POR
   fi
 done
 echo "================================================================"
+
+# Build optional content_scenes override.  Hydra needs the form
+#   'habitat.dataset.content_scenes=[a,b,c]'
+# with the list inside the same single-quoted token so the brackets aren't
+# interpreted by the shell.
+EXTRA_OVERRIDES=()
+if [ -n "${CONTENT_SCENES}" ]; then
+  EXTRA_OVERRIDES+=("habitat.dataset.content_scenes=[${CONTENT_SCENES}]")
+fi
+if [ -n "${EPISODE_IDS}" ]; then
+  EXTRA_OVERRIDES+=("habitat.dataset.episode_ids=[${EPISODE_IDS}]")
+  # Auto-set N_EPISODES to the number of requested IDs if the caller left it
+  # at the default "1" (single-scene smoke mode), so tqdm runs the right count.
+  if [ "${N_EPISODES}" = "1" ]; then
+    N_EPISODES="$(echo "${EPISODE_IDS}" | tr ',' '\n' | wc -l)"
+  fi
+fi
 
 timeout "${TIMEOUT_S}" python -um vlfm.run \
   habitat_baselines.evaluate=True \
@@ -92,10 +118,11 @@ timeout "${TIMEOUT_S}" python -um vlfm.run \
   habitat_baselines.torch_gpu_id="${VLFM_POINTNAV_GPU_ID}" \
   habitat_baselines.video_dir="${VIDEO_DIR}" \
   habitat_baselines.tensorboard_dir="${TB_DIR}" \
+  "${EXTRA_OVERRIDES[@]}" \
   > "${LOG}" 2>&1
 EXIT=$?
 
-echo "EXIT=${EXIT}  (124 = wall-clock timeout, 0 = clean exit)"
+echo "EXIT=${EXIT}  (124 = wall-clock timeout, 0 = clean exit, 134 = SIGABRT, 139 = SIGSEGV)"
 echo "-- episode metrics --"
 rg -iE 'success rate|spl|distance_to_goal|success: [01]|Failure cause' "${LOG}" | tail -10 || true
 echo "-- video files written --"
@@ -103,3 +130,8 @@ ls -lh "${VIDEO_DIR}/" 2>/dev/null || true
 echo "-- post-run GPU usage --"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | head -10
 echo "DONE"
+
+# Propagate the python timeout's real exit code to the caller.  Without this
+# the script's last command (echo "DONE") returns 0 and the orchestrator never
+# sees timeout (124) or native-crash (134/139) failures.
+exit "${EXIT}"

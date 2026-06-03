@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>子文档 01 · PointNav ResNet 内部结构</title>
+<style>
+  :root {
+    --fg:#1f2328; --bg:#fff; --muted:#6e7781; --line:#d0d7de;
+    --code:#f6f8fa; --accent:#0969da; --warn:#bf8700; --good:#1a7f37;
+  }
+  html,body { margin:0; padding:0; background:var(--bg); color:var(--fg);
+              font:14px/1.6 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }
+  main { max-width: 980px; margin: 24px auto 80px; padding: 0 18px; }
+  h1 { font-size: 26px; margin: 0 0 6px; }
+  h2 { font-size: 20px; margin: 28px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--line); }
+  h3 { font-size: 16px; margin: 18px 0 6px; color:#24292f; }
+  p, li { margin: 4px 0; }
+  code { background: var(--code); padding: 1px 5px; border-radius: 4px;
+         font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace; font-size: 12.5px;}
+  pre { background: var(--code); padding: 10px 12px; border-radius: 6px; overflow:auto;
+        font-family: ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,monospace;
+        font-size: 12.5px; line-height:1.55; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0 14px; font-size: 13px; }
+  th, td { border:1px solid var(--line); padding: 6px 9px; vertical-align: top; text-align:left; }
+  th { background:#f6f8fa; }
+  .muted { color: var(--muted); }
+  .callout { background:#ddf4ff; border-left:4px solid var(--accent); padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .warn   { background:#fff8c5; border-left:4px solid var(--warn);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .good   { background:#dafbe1; border-left:4px solid var(--good);   padding:8px 12px; border-radius:4px; margin:10px 0; }
+  .row { display:flex; gap:18px; flex-wrap:wrap; }
+  .row > div { flex:1 1 320px; }
+  svg { display:block; max-width:100%; height:auto; }
+  .legend { font-size:12px; color:var(--muted); margin-top:4px; }
+  details summary { cursor:pointer; font-weight:600; margin:6px 0; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>子文档 01 · PointNav ResNet 内部结构</h1>
+<p class="muted">配套：<a href="./数据链全景README.md">数据链全景 README</a> §6 / §8。本文专门展开 VLFM 用到的
+<code>WrappedPointNavResNetPolicy</code> 那个"出 (1,1) long 动作"的小网络，从输入张量一路捋到 softmax 之前。</p>
+
+<div class="callout">
+  <b>一句话：</b>这是一个 <b>depth-only + (ρ,θ)</b> 的 <b>ResNet-18 + 2 层 LSTM(512)</b> 离散策略，
+  ckpt 文件是 <code>data/pointnav_weights.pth</code>，来自 Habitat DD-PPO 训练；VLFM 自己没有重训它。
+</div>
+
+<h2>1. 在 VLFM 数据链中的位置</h2>
+<pre>
+ITMPolicyV2.act
+ └─ BaseObjectNavPolicy.act
+     ├─ navigate 分支: _pointnav(get_best_object(target), stop=True)
+     └─ explore  分支: _pointnav(best_frontier,            stop=False)
+                              │
+                              ▼
+                self._pointnav_policy.act(obs, masks, deterministic=True)
+                              │
+                              ▼
+            WrappedPointNavResNetPolicy.act → action: Tensor (1,1) long
+</pre>
+
+<p>调用现场（<code>vlfm/policy/base_objectnav_policy.py</code> 经由 <code>_pointnav</code>）：</p>
+<pre>
+obs = {
+    "depth": image_resize(nav_depth, (224,224), channels_last=True, mode="area"),   # (1,224,224,1) float32 ∈[0,1]
+    "pointgoal_with_gps_compass": torch.tensor([[rho, theta]], dtype=float32),       # (1,2)
+}
+action = self._pointnav_policy.act(obs, masks, deterministic=True)                   # (1,1) long
+</pre>
+
+<h2>2. 三个加载分支（容易踩坑）</h2>
+<p>文件 <code>vlfm/policy/utils/pointnav_policy.py</code> 里有 <b>三套</b> 实现，按环境自动挑：</p>
+
+<table>
+<thead><tr><th>条件</th><th>实际类</th><th>backbone 来源</th><th>动作分布</th><th>VLFM 是否常用</th></tr></thead>
+<tbody>
+<tr>
+  <td>装了 habitat-lab，<code>habitat.__version__ == "0.1.5"</code></td>
+  <td>habitat <code>PointNavResNetPolicy</code> 包一层，但 <code>net</code> 被覆盖成
+      <code>nh_pointnav_policy.PointNavResNetNet(discrete_actions=True)</code></td>
+  <td>vlfm 自带 resnet18（GroupNorm 版）</td>
+  <td>Categorical(4)</td>
+  <td>SemExp 复现走这条</td>
+</tr>
+<tr>
+  <td>装了较新 habitat（默认配置）</td>
+  <td>habitat 原版 <code>PointNavResNetPolicy.from_config(ckpt["config"])</code></td>
+  <td>habitat-baselines 自带 resnet</td>
+  <td>由 ckpt config 决定，HM3D 权重是 <b>Categorical 4 类离散</b></td>
+  <td>✅ HM3D 默认</td>
+</tr>
+<tr>
+  <td>没装 habitat-lab（reality / 真机）</td>
+  <td>vlfm 自带 <code>nh_pointnav_policy.PointNavResNetPolicy</code></td>
+  <td>vlfm 自带 resnet18</td>
+  <td><b>GaussianNet (μ, σ)</b> 连续 2 维（线速 + 角速）</td>
+  <td>真机 / Spot 控制走这条</td>
+</tr>
+</tbody>
+</table>
+
+<div class="warn">
+  这就是为什么 <code>WrappedPointNavResNetPolicy.__init__</code> 里要写
+  <code>discrete_actions = not hasattr(self.policy.action_distribution, "mu_maybe_std")</code>：
+  连续策略才有 <code>mu_maybe_std</code>，离散策略没有；据此决定 <code>pointnav_prev_actions</code> 是
+  <code>(1,1) long</code> 还是 <code>(1,2) float32</code>。HM3D 评测下永远是离散。
+</div>
+
+<h2>3. 离散策略 forward 全展开（HM3D 默认）</h2>
+<p>下面以 <b>habitat 原版 PointNavResNetPolicy（discrete）</b>为准。每个张量的 shape 都按 VLFM 实际 batch=1、224×224 标了。</p>
+
+<h3>3.1 输入</h3>
+<pre>
+observations = {
+  "depth":                       (1, 224, 224, 1) float32 ∈ [0,1]   # 已被 image_resize area
+  "pointgoal_with_gps_compass":  (1, 2)            float32           # (ρ 米, θ 弧度)
+}
+rnn_hidden_states:   (1, num_recurrent_layers=4, 512)  float32   # 2 层 LSTM × (h, c) = 4
+prev_actions:        (1, 1)                            long       # 上一步动作 id ∈ {0,1,2,3}
+masks:               (1, 1)                            bool       # episode 起始 0，其余 1
+</pre>
+
+<h3>3.2 视觉支路</h3>
+<svg viewBox="0 0 940 280" role="img" aria-label="ResNet-18 visual branch">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1f2328"/>
+    </marker>
+    <style>
+      .blk { fill:#eef4ff; stroke:#0969da; stroke-width:1; }
+      .res { fill:#fff8c5; stroke:#bf8700; stroke-width:1; }
+      .out { fill:#dafbe1; stroke:#1a7f37; stroke-width:1; }
+      .lbl { font: 12px ui-monospace,Menlo,monospace; fill:#1f2328; text-anchor:middle; }
+      .sub { font: 11px ui-monospace,Menlo,monospace; fill:#6e7781; text-anchor:middle; }
+      .ar  { stroke:#1f2328; stroke-width:1.4; fill:none; marker-end:url(#arr); }
+    </style>
+  </defs>
+
+  <!-- input -->
+  <rect class="blk" x="10"  y="100" width="110" height="60" rx="6"/>
+  <text class="lbl" x="65"  y="130">depth (1,224,224,1)</text>
+  <text class="sub" x="65"  y="150">permute → (1,1,224,224)</text>
+
+  <!-- avg pool -->
+  <rect class="blk" x="135" y="100" width="90"  height="60" rx="6"/>
+  <text class="lbl" x="180" y="125">avg_pool2d</text>
+  <text class="sub" x="180" y="145">k=2 ⇒ 112×112</text>
+
+  <!-- conv1 + bn + maxpool -->
+  <rect class="blk" x="240" y="100" width="130" height="60" rx="6"/>
+  <text class="lbl" x="305" y="123">Conv7×7 s=2 + GN+ReLU</text>
+  <text class="sub" x="305" y="143">+ MaxPool 3×3 s=2 → 28×28</text>
+
+  <!-- resnet18 stages -->
+  <rect class="res" x="385" y="20"  width="110" height="60" rx="6"/>
+  <text class="lbl" x="440" y="45">layer1 ×2 BasicBlock</text>
+  <text class="sub" x="440" y="65">32ch, 28×28</text>
+
+  <rect class="res" x="385" y="90"  width="110" height="60" rx="6"/>
+  <text class="lbl" x="440" y="115">layer2 ×2 BasicBlock</text>
+  <text class="sub" x="440" y="135">64ch, 14×14, s=2</text>
+
+  <rect class="res" x="385" y="160" width="110" height="60" rx="6"/>
+  <text class="lbl" x="440" y="185">layer3 ×2 BasicBlock</text>
+  <text class="sub" x="440" y="205">128ch, 7×7, s=2</text>
+
+  <rect class="res" x="385" y="230" width="110" height="40" rx="6"/>
+  <text class="lbl" x="440" y="255">layer4 ×2 → 256ch 4×4</text>
+
+  <!-- compression -->
+  <rect class="blk" x="520" y="100" width="120" height="60" rx="6"/>
+  <text class="lbl" x="580" y="123">Conv3×3 256→128</text>
+  <text class="sub" x="580" y="143">+ GN(1) + ReLU</text>
+
+  <!-- flatten + fc -->
+  <rect class="blk" x="660" y="100" width="120" height="60" rx="6"/>
+  <text class="lbl" x="720" y="125">Flatten 2048</text>
+  <text class="sub" x="720" y="145">Linear → 512 + ReLU</text>
+
+  <!-- output -->
+  <rect class="out" x="800" y="100" width="120" height="60" rx="6"/>
+  <text class="lbl" x="860" y="125">visual_feat</text>
+  <text class="sub" x="860" y="145">(1, 512)</text>
+
+  <!-- arrows -->
+  <path class="ar" d="M120,130 H135"/>
+  <path class="ar" d="M225,130 H240"/>
+  <path class="ar" d="M370,130 H385" />
+  <path class="ar" d="M495,250 H510 V165 H520"/>
+  <path class="ar" d="M640,130 H660"/>
+  <path class="ar" d="M780,130 H800"/>
+</svg>
+<div class="legend">蓝框 = 普通层；黄框 = ResNet stage (BasicBlock with GroupNorm)；绿框 = 输出。
+   关键尺寸链：<code>224 → avgpool ⇒ 112 → conv7s2 ⇒ 56 → maxpool ⇒ 28 → /2/2/2 ⇒ 4 → conv3 128ch ⇒ Flatten 128·4·4=2048 → Linear 512</code>。</div>
+
+<details><summary>🔬 跟 torchvision ResNet-18 的关键差别</summary>
+<ul>
+  <li>用 <code>nn.GroupNorm</code> 替代 BatchNorm（DD-PPO 经典做法，rollout 里 batch 太小用 BN 不稳）。</li>
+  <li><b>base_planes 只有 32</b>（torchvision 是 64），所以最终通道是 256 而不是 512，参数量减半。</li>
+  <li>开头加了一道 <code>avg_pool2d(k=2)</code>，相当于先把 224 直接降到 112，再走 conv7s2，所以最终 spatial 是 4×4 而不是 7×7。</li>
+  <li>没有全局平均池化，而是 <code>1×1 conv 256→128</code> + flatten，明显是为了让 LSTM 看到一点空间结构。</li>
+</ul>
+</details>
+
+<h3>3.3 goal + 上一步动作 + LSTM</h3>
+<svg viewBox="0 0 940 240" role="img" aria-label="goal embedding + lstm">
+  <defs>
+    <style>
+      .gbox { fill:#fde7f3; stroke:#bf3989; stroke-width:1; }
+      .lbox { fill:#ddf4ff; stroke:#0969da; stroke-width:1; }
+      .head { fill:#dafbe1; stroke:#1a7f37; stroke-width:1; }
+    </style>
+  </defs>
+
+  <!-- goal -->
+  <rect class="gbox" x="10"  y="20"  width="200" height="60" rx="6"/>
+  <text class="lbl" x="110" y="45">pointgoal (1,2) = (ρ, θ)</text>
+  <text class="sub" x="110" y="65">→ stack(ρ, cos(-θ), sin(-θ)) → (1,3)</text>
+
+  <rect class="gbox" x="230" y="20"  width="170" height="60" rx="6"/>
+  <text class="lbl" x="315" y="45">tgt_embeding Linear 3→32</text>
+  <text class="sub" x="315" y="65">(1, 32)</text>
+
+  <!-- prev action -->
+  <rect class="gbox" x="10"  y="100" width="200" height="60" rx="6"/>
+  <text class="lbl" x="110" y="125">prev_actions (1,1) long</text>
+  <text class="sub" x="110" y="145">masks=0 → start_token 0</text>
+
+  <rect class="gbox" x="230" y="100" width="170" height="60" rx="6"/>
+  <text class="lbl" x="315" y="125">prev_action_embedding</text>
+  <text class="sub" x="315" y="145">Embedding(5, 32) → (1, 32)</text>
+
+  <!-- visual feat (from previous diagram) -->
+  <rect class="lbox" x="10"  y="180" width="390" height="40" rx="6"/>
+  <text class="lbl" x="205" y="205">visual_feat (1, 512)  ← 来自上图</text>
+
+  <!-- concat -->
+  <rect class="lbox" x="420" y="80"  width="100" height="60" rx="6"/>
+  <text class="lbl" x="470" y="105">cat dim=1</text>
+  <text class="sub" x="470" y="125">(1, 576)</text>
+
+  <!-- LSTM -->
+  <rect class="lbox" x="540" y="60"  width="220" height="100" rx="6"/>
+  <text class="lbl" x="650" y="90">LSTMStateEncoder</text>
+  <text class="sub" x="650" y="110">input=576, hidden=512, layers=2</text>
+  <text class="sub" x="650" y="128">num_recurrent_layers = 2·2 = 4</text>
+  <text class="sub" x="650" y="146">(为 LSTM 的 (h, c) 各算一层)</text>
+
+  <!-- head -->
+  <rect class="head" x="780" y="80"  width="150" height="60" rx="6"/>
+  <text class="lbl" x="855" y="105">action_distribution</text>
+  <text class="sub" x="855" y="125">Categorical(4) / Gaussian(2)</text>
+
+  <!-- arrows -->
+  <path class="ar" d="M210,50  H230"/>
+  <path class="ar" d="M210,130 H230"/>
+  <path class="ar" d="M400,50  H440 V90 H420"/>
+  <path class="ar" d="M400,130 H420"/>
+  <path class="ar" d="M400,200 H440 V140 H420"/>
+  <path class="ar" d="M520,110 H540"/>
+  <path class="ar" d="M760,110 H780"/>
+</svg>
+
+<p><b>关键细节</b>：</p>
+<ul>
+  <li><b>goal_observations 的三元化</b>：原本 (ρ,θ) 两维，被改写成 <code>(ρ, cos(-θ), sin(-θ))</code>，这样 LSTM 看到的是
+      一个角度连续可微的 3 维向量，避免 θ 从 +π 跳到 -π 时梯度炸。</li>
+  <li><b>prev_actions 的 mask 技巧</b>：episode 开始时 <code>masks=0</code>，
+      <code>torch.where(masks, prev+1, start_token=0)</code> 直接把 prev 替换成 dummy id 0；
+      Embedding 表是 <code>(4+1, 32)</code>，多出来那一行就是这个 "start" 符号。</li>
+  <li><b>LSTMStateEncoder.forward 里有 <code>masks.view(1,-1,1)</code> reset hidden</b>：episode 起始/done 后那一步会把 (h, c) 强制清零，
+      这就是 <code>WrappedPointNavResNetPolicy._pointnav</code> 里换目标时要传 <code>masks=0</code> 的根本原因。</li>
+  <li><b>hidden state 张量打包</b>：habitat 把 (h, c) 沿 layer 维 <code>torch.cat</code> 成一个 <code>(1, 2·num_layers, 512)</code> 的张量在外面带着走，
+      <code>WrappedPointNavResNetPolicy</code> 里就是 <code>(1, 4, 512)</code>。</li>
+</ul>
+
+<h3>3.4 动作头</h3>
+<table>
+<thead><tr><th>模式</th><th>head</th><th>输出</th><th>动作含义</th></tr></thead>
+<tbody>
+<tr>
+  <td>HM3D 默认（discrete）</td>
+  <td>Linear(512, 4) → Categorical</td>
+  <td>id ∈ {0:STOP, 1:MOVE_FORWARD, 2:TURN_LEFT, 3:TURN_RIGHT}</td>
+  <td>habitat <code>turn_angle=30°</code>，<code>forward_step=0.25 m</code></td>
+</tr>
+<tr>
+  <td>真机/Spot（continuous）</td>
+  <td><code>GaussianNet(512, 2)</code>：μ=tanh(Linear), σ=clamp+exp</td>
+  <td>(1, 2) float ∈ [-1, 1]</td>
+  <td>(v_lin, v_ang)，由 reality_policy 再映射成米/秒、弧度/秒</td>
+</tr>
+</tbody>
+</table>
+
+<div class="callout">
+  注意 <code>WrappedPointNavResNetPolicy.act(deterministic=True)</code>：离散时取 argmax（实际走的是 <code>distribution.mode</code>），
+  连续时取 μ。所以 VLFM 评测里 PointNav 是<b>确定性</b>的，整条管线确定性可复现。
+</div>
+
+<h2>4. (h, c) 的生命周期 / 何时 reset</h2>
+<pre>
+WrappedPointNavResNetPolicy.__init__:
+    pointnav_test_recurrent_hidden_states = zeros(1, 4, 512)
+    pointnav_prev_actions                 = zeros(1, 1, long)
+
+每帧 BaseObjectNavPolicy._pointnav(goal, stop):
+    if 第 0 步:                masks = 0
+    elif |goal - last_goal|>0.1m: self._pointnav_policy.reset(); masks = 0   # ← 关键
+    else:                       masks = 1
+    action = self._pointnav_policy.act(obs, masks)
+    self._pointnav_policy.pointnav_prev_actions          ← action.clone()
+    self._pointnav_policy.pointnav_test_recurrent_hidden ← rnn_hidden_states
+</pre>
+
+<div class="warn">
+  这就是为什么 VLFM 在 navigate → explore 切换、或者目标点云中心跳了一下时，PointNav 经常会出现"突然走神又重新瞄准"的现象——
+  hidden 被清零，LSTM 失忆，要靠 ResNet 这一帧的特征独立判断。这点 <code>ObjectPointCloudMap.get_best_object</code> 的
+  0.1m 滞回阈值就是专门为它做的：能不抖就别抖。
+</div>
+
+<h2>5. 训练背景（不影响推理但有助于直觉）</h2>
+<ul>
+  <li>这套权重是 <a href="https://arxiv.org/abs/1911.00357">DD-PPO (Wijmans et al., 2020)</a> 在
+      Gibson + MP3D PointGoal 上跑出来的——纯 depth 输入，奖励是 "靠近 goal 距离差 + STOP 奖励"。</li>
+  <li>VLFM 直接 freeze 当 low-level controller 用，自己只决定 <b>goal 是哪儿</b>（YOLO 找到的物体 / 选中的 frontier），
+      <b>什么时候发 STOP</b>（只有 navigate 模式下、距 goal &lt;0.9m 才允许，由策略外层判断，不走网络）。</li>
+  <li>对应论文：VLFM 把 PointNav 当 "skill"，整个 ObjectNav 决策上层完全 zero-shot，只这一处用了预训练 RL 权重。</li>
+</ul>
+
+<h2>6. 想自己 trace 一帧时的断点位置</h2>
+<ol>
+  <li><code>vlfm/policy/base_objectnav_policy.py · _pointnav</code>
+      打印 <code>rho, theta, masks, goal</code>，确认输入语义对。</li>
+  <li><code>vlfm/policy/utils/pointnav_policy.py · WrappedPointNavResNetPolicy.act</code>
+      打印 <code>observations["depth"].shape</code>、<code>pointnav_test_recurrent_hidden_states.shape</code>。</li>
+  <li><code>vlfm/policy/utils/non_habitat_policy/nh_pointnav_policy.py · PointNavResNetNet.forward</code>
+      （如果你的环境走的是 non-habitat 分支）打印 <code>visual_feats.shape, x.shape, out.shape</code>。</li>
+  <li>habitat 原版分支的可见 forward 在
+      <code>habitat_baselines/rl/ddppo/policy/resnet_policy.py · PointNavResNetNet.forward</code>，
+      结构跟上图同构、只是通道数等可能略大（取决于 ckpt config）。</li>
+</ol>
+
+<p class="muted">↩ 回到 <a href="./数据链全景README.md">数据链全景 README</a> · 同级子文档：
+   <a href="./sub_02_fog_of_war算法.html">fog_of_war 算法</a> ·
+   <a href="./sub_03_ITMPolicyV3_双通道.html">ITMPolicyV3 双通道</a></p>
+
+</main>
+</body>
+</html>
