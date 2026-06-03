@@ -226,6 +226,21 @@ class VLFMTrainer(PPOTrainer):
                 device="cpu",
             )
 
+            if "VLFM_DUMP_RGB_DIR" in os.environ:
+                import imageio, numpy as _np
+                _ddir = os.environ["VLFM_DUMP_RGB_DIR"]
+                os.makedirs(_ddir, exist_ok=True)
+                _gstep = getattr(self, "_vlfm_dump_step", 0)
+                for _i in range(len(observations)):
+                    _rgb = observations[_i]["rgb"]
+                    if hasattr(_rgb, "cpu"):
+                        _rgb = _rgb.cpu().numpy()
+                    _rgb = _np.asarray(_rgb).astype("uint8")
+                    _act = step_data[_i] if _i < len(step_data) else -1
+                    imageio.imwrite(os.path.join(_ddir, "env%d_step%04d_act%s.png" % (_i, _gstep, _act)), _rgb)
+                _arr = _np.asarray(observations[0]["rgb"]).astype("float32")
+                print("[RGBDUMP] step %d shape %s mean %.3f std %.3f" % (_gstep, str(_arr.shape), _arr.mean(), _arr.std()), flush=True)
+                self._vlfm_dump_step = _gstep + 1
             rewards = torch.tensor(rewards_l, dtype=torch.float, device="cpu").unsqueeze(1)
             current_episode_reward += rewards
             next_episodes_info = self.envs.current_episodes()

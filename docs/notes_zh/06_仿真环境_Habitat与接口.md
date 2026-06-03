@@ -393,7 +393,7 @@ def host_model(model, name, port):
 - `localhost:12184/yolov7` → YOLOv7
 - `localhost:12185/blip2` → BLIP2 VQA（可选，`use_vqa=True` 才用）
 
-由 `scripts/launch_vlm_servers.sh` 用 tmux 拉起 4 panes，模型加载好后驻留 GPU 显存（每次 RPC 不重新加载）。
+由 `scripts/upstream/launch_vlm_servers.sh` 用 tmux 拉起 4 panes，模型加载好后驻留 GPU 显存（每次 RPC 不重新加载）。
 
 ### 6.5.2 客户端（VLFM 这边）
 

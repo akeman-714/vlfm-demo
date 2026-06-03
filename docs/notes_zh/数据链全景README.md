@@ -602,7 +602,7 @@ def _pointnav(self, goal, stop=False) -> Tensor:
 
 ## 9. VLM 服务端口一览
 
-启动脚本 `scripts/launch_vlm_servers.sh` 会开 5 个独立 Flask 进程：
+启动脚本 `scripts/upstream/launch_vlm_servers.sh` 会开 5 个独立 Flask 进程：
 
 | 端口（默认 / 环境变量） | 服务 | 客户端类 | 作用 |
 | --- | --- | --- | --- |

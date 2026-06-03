@@ -105,7 +105,7 @@ The weights for MobileSAM, GroundingDINO, and PointNav must be saved to the `dat
 ## :arrow_forward: Evaluation within Habitat
 To run evaluation, various models must be loaded in the background first. This only needs to be done once by running the following command:
 ```bash
-./scripts/launch_vlm_servers.sh
+./scripts/upstream/launch_vlm_servers.sh
 ```
 (You may need to run `chmod +x` on this file first.)
 This command will create a tmux session that will start loading the various models used for VLFM and serving them through `flask`. When you are done, be sure to kill the tmux session to free up your GPU.
