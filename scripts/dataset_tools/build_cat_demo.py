@@ -33,9 +33,9 @@ import numpy as np
 import trimesh
 
 REPO = Path("/data/jinsong.yuan/vlfm-demo/vlfm")
-GLB_PATH = REPO / "data/scene_datasets/hm3d/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
+GLB_PATH = REPO / "data/scene_datasets/hm3d/val/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
 SCENE_DATASET_CFG = REPO / "data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
-ORIG_EP = REPO / "data/datasets/objectnav/hm3d/v1/val/content/TEEsavR23oF.json.gz.orig"
+ORIG_EP = REPO / "data/datasets/objectnav/hm3d/v1/val/content/TEEsavR23oF.json.gz"
 NEW_SPLIT_ROOT = REPO / "data/datasets/objectnav/hm3d/v1/cat_demo"
 NEW_ROOT_FILE = NEW_SPLIT_ROOT / "cat_demo.json.gz"
 NEW_CONTENT_FILE = NEW_SPLIT_ROOT / "content/TEEsavR23oF.json.gz"

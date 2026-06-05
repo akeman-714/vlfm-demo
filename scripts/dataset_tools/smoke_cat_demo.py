@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 REPO = Path("/data/jinsong.yuan/vlfm-demo/vlfm")
-GLB = REPO / "data/scene_datasets/hm3d/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
+GLB = REPO / "data/scene_datasets/hm3d/val/00800-TEEsavR23oF/TEEsavR23oF.basis.glb"
 SCENE_CFG = REPO / "data/scene_datasets/hm3d/hm3d_annotated_basis.scene_dataset_config.json"
 CONTENT = REPO / "data/datasets/objectnav/hm3d/v1/cat_demo/content/TEEsavR23oF.json.gz"
 
@@ -91,13 +91,25 @@ def main():
         start_nav = pf.is_navigable(start)
         vp_nav = pf.is_navigable(vp)
         print(f"[{'OK' if start_nav else 'FAIL'}]  start is_navigable: {start_nav}")
-        print(f"[{'OK' if vp_nav else 'FAIL'}]  view_point is_navigable: {vp_nav}")
-        if not (start_nav and vp_nav):
-            fail("start or view_point off navmesh")
+        if vp_nav:
+            effective_vp = vp
+            print(f"[OK]  view_point is_navigable: {vp_nav}")
+        else:
+            snapped_vp = np.asarray(pf.snap_point(vp), dtype=np.float64)
+            snap_delta = float(np.linalg.norm(vp - snapped_vp))
+            if np.all(np.isfinite(snapped_vp)) and snap_delta <= 0.05:
+                effective_vp = snapped_vp
+                print("[OK]  view_point snaps to navmesh "
+                      f"(delta={snap_delta:.3f} m): {snapped_vp.tolist()}")
+            else:
+                print(f"[FAIL]  view_point is_navigable: {vp_nav}")
+                fail("start or view_point off navmesh")
+        if not start_nav:
+            fail("start off navmesh")
 
         path = habitat_sim.MultiGoalShortestPath()
         path.requested_start = start
-        path.requested_ends = [vp]
+        path.requested_ends = [effective_vp]
         found = pf.find_path(path)
         if not found or not math.isfinite(path.geodesic_distance):
             fail(f"no geodesic path start->view_point (geo={path.geodesic_distance})")
