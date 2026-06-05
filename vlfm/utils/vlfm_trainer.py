@@ -241,6 +241,26 @@ class VLFMTrainer(PPOTrainer):
                 _arr = _np.asarray(observations[0]["rgb"]).astype("float32")
                 print("[RGBDUMP] step %d shape %s mean %.3f std %.3f" % (_gstep, str(_arr.shape), _arr.mean(), _arr.std()), flush=True)
                 self._vlfm_dump_step = _gstep + 1
+            if "VLFM_DUMP_BEV_DIR" in os.environ:
+                import imageio, numpy as _np
+
+                _bdir = os.environ["VLFM_DUMP_BEV_DIR"]
+                os.makedirs(_bdir, exist_ok=True)
+                _gstep = getattr(self, "_vlfm_dump_bev_step", 0)
+                for _i in range(len(infos)):
+                    _bev = None
+                    if _i < len(policy_infos) and "obstacle_map" in policy_infos[_i]:
+                        _bev = HabitatVis._reorient_rescale_habitat_map(infos, policy_infos[_i]["obstacle_map"])
+                    elif "top_down_map" in infos[_i]:
+                        from habitat.utils.visualizations import maps as _maps
+
+                        _bev = _maps.colorize_draw_agent_and_fit_to_height(infos[_i]["top_down_map"], 480)
+                    if _bev is None:
+                        continue
+                    _bev = _np.asarray(_bev).astype("uint8")
+                    _act = step_data[_i] if _i < len(step_data) else -1
+                    imageio.imwrite(os.path.join(_bdir, "env%d_step%04d_act%s.png" % (_i, _gstep, _act)), _bev)
+                self._vlfm_dump_bev_step = _gstep + 1
             rewards = torch.tensor(rewards_l, dtype=torch.float, device="cpu").unsqueeze(1)
             current_episode_reward += rewards
             next_episodes_info = self.envs.current_episodes()

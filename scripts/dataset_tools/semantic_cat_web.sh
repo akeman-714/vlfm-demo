@@ -25,16 +25,12 @@ export SEMANTIC_CAT_WEB_PORT="${SEMANTIC_CAT_WEB_PORT:-7861}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5,0}"
 export VLFM_POINTNAV_GPU_ID="${VLFM_POINTNAV_GPU_ID:-1}"
 
-echo ">>> Semantic ObjectNav Web"
+echo ">>> ObjectNav Run Web"
 echo ">>> URL on cloud : http://${SEMANTIC_CAT_WEB_HOST}:${SEMANTIC_CAT_WEB_PORT}"
 echo ">>> SSH tunnel   : ssh -N -L 17861:127.0.0.1:${SEMANTIC_CAT_WEB_PORT} -p 20755 jinsong.yuan@120.133.130.214"
 echo ">>> Laptop URL   : http://127.0.0.1:17861"
 echo ">>> CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}  (sim/EGL=cuda:0, nav=cuda:${VLFM_POINTNAV_GPU_ID})"
-if [ -z "${BAILIAN_API_KEY:-}${DASHSCOPE_API_KEY:-}${OPENAI_API_KEY:-}" ]; then
-  echo ">>> API key      : not set in server env; enter one in the page before Run"
-else
-  echo ">>> API key      : set"
-fi
+echo ">>> Run modes    : semantic_query, find_cat, global_home_40, global_home_100, object_memory_cat, persistent_memory_cat_pair"
 
 PIDS_ON_PORT="$(ss -ltnp 2>/dev/null | awk -v port=":${SEMANTIC_CAT_WEB_PORT}" '
   $4 ~ port"$" {

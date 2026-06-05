@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Web UI for natural-language ObjectNav demos.
+"""Web UI for ObjectNav demo and navigation-test runs.
 
 Flow:
-  user text -> Bailian semantic label -> demo eval split -> live RGB frames -> saved mp4
+  run mode -> demo eval split/env -> live RGB/BEV frames -> saved mp4
 """
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import threading
@@ -28,12 +27,79 @@ LABEL_TO_SPLIT = {
     "cat": "cat_demo",
     "toilet": "toilet_demo",
 }
+RUN_MODES: dict[str, dict[str, Any]] = {
+    "semantic_query": {
+        "name": "Semantic Query",
+        "label": "semantic",
+        "split": None,
+        "stage": "semantic",
+        "env": {},
+        "semantic": True,
+    },
+    "find_cat": {
+        "name": "Find Cat",
+        "label": "cat",
+        "split": "cat_demo",
+        "stage": "finding",
+        "env": {},
+    },
+    "global_home_40": {
+        "name": "Global Home 40",
+        "label": "home@40",
+        "split": "cat_demo",
+        "stage": "global-home-40",
+        "env": {
+            "VLFM_GLOBAL_NAV": "1",
+            "VLFM_NAV_DEBUG_GOAL": "0,0",
+            "VLFM_NAV_DEBUG_AFTER": "40",
+            "VLFM_NAV_DEBUG_CONSERVATIVE": "1",
+            "VLFM_NAV_DEBUG_LOG": "1",
+        },
+    },
+    "global_home_100": {
+        "name": "Global Home 100",
+        "label": "home@100",
+        "split": "cat_demo",
+        "stage": "global-home-100",
+        "env": {
+            "VLFM_GLOBAL_NAV": "1",
+            "VLFM_NAV_DEBUG_GOAL": "0,0",
+            "VLFM_NAV_DEBUG_AFTER": "100",
+            "VLFM_NAV_DEBUG_CONSERVATIVE": "1",
+            "VLFM_NAV_DEBUG_LOG": "1",
+        },
+    },
+    "object_memory_cat": {
+        "name": "Object Memory Cat",
+        "label": "memory-cat",
+        "split": "cat_demo",
+        "stage": "object-memory",
+        "env": {
+            "VLFM_GLOBAL_NAV": "1",
+            "VLFM_OBJECT_MEMORY_PATH": str(REPO / "data" / "object_memory" / "module2_demo" / "cat.json"),
+            "VLFM_NAV_DEBUG_LOG": "1",
+        },
+    },
+    "persistent_memory_cat_pair": {
+        "name": "Persistent Map + Memory Cat Pair",
+        "label": "map+memory-cat",
+        "split": "cat_demo",
+        "stage": "persistent-memory-pair",
+        "env": {
+            "VLFM_GLOBAL_NAV": "1",
+            "VLFM_NAV_DEBUG_LOG": "1",
+            "VLFM_MEMORY_NAV_CONSERVATIVE": "0",
+        },
+        "paired_persistent": True,
+    },
+}
 
 
 @dataclass
 class RunState:
     run_id: str
     request_text: str
+    run_mode: str = "find_cat"
     status: str = "starting"
     stage: str = "queued"
     label: Optional[str] = None
@@ -45,12 +111,14 @@ class RunState:
     exit_code: Optional[int] = None
     run_dir: str = ""
     live_dir: str = ""
+    live_bev_dir: str = ""
     video_dir: str = ""
     tb_dir: str = ""
     log_path: str = ""
     video_path: Optional[str] = None
     live_video_path: Optional[str] = None
     latest_frame: Optional[str] = None
+    latest_bev_frame: Optional[str] = None
 
 
 app = Flask(__name__, static_folder=None)
@@ -89,6 +157,7 @@ def _serialize(run: RunState) -> dict[str, Any]:
     data = asdict(run)
     data["elapsed_sec"] = round((run.finished_at or time.time()) - run.started_at, 1)
     data["latest_frame_url"] = f"/api/runs/{run.run_id}/latest-frame" if run.latest_frame else None
+    data["latest_bev_frame_url"] = f"/api/runs/{run.run_id}/latest-bev-frame" if run.latest_bev_frame else None
     data["video_url"] = f"/api/runs/{run.run_id}/video" if run.video_path else None
     data["live_video_url"] = f"/api/runs/{run.run_id}/live-video" if run.live_video_path else None
     data["log_tail"] = _tail(Path(run.log_path), 100) if run.log_path else ""
@@ -109,13 +178,17 @@ def _watch_outputs(run_id: str, stop_event: threading.Event) -> None:
             if run is None:
                 return
             live_dir = Path(run.live_dir)
+            live_bev_dir = Path(run.live_bev_dir)
             video_dir = Path(run.video_dir)
 
         latest_frame = _latest_file(live_dir, "*.png")
+        latest_bev_frame = _latest_file(live_bev_dir, "*.png")
         latest_video = _latest_file(video_dir, "*.mp4")
         changes: dict[str, Any] = {}
         if latest_frame is not None:
             changes["latest_frame"] = str(latest_frame)
+        if latest_bev_frame is not None:
+            changes["latest_bev_frame"] = str(latest_bev_frame)
         if latest_video is not None:
             changes["video_path"] = str(latest_video)
         if changes:
@@ -160,79 +233,184 @@ def _resolve_semantic_goal(text: str, api_key_override: str = "") -> GoalResolut
     )
 
 
-def _run_eval(run_id: str, text: str, api_key: str = "") -> None:
+def _run_eval_process(
+    run_id: str,
+    split: str,
+    stage_name: str,
+    env_overrides: dict[str, Any],
+    stage_root: Path,
+) -> tuple[int, Optional[Path], Optional[Path]]:
+    run = _safe_run(run_id)
+    video_dir = stage_root / "video"
+    tb_dir = stage_root / "tb"
+    live_dir = stage_root / "live_rgb"
+    live_bev_dir = stage_root / "live_bev"
+    log_path = stage_root / "vlfm.log"
+    for directory in (stage_root, video_dir, tb_dir, live_dir, live_bev_dir):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    _set_run(
+        run_id,
+        stage=stage_name,
+        live_dir=str(live_dir),
+        live_bev_dir=str(live_bev_dir),
+        video_dir=str(video_dir),
+        tb_dir=str(tb_dir),
+        log_path=str(log_path),
+        video_path=None,
+        live_video_path=None,
+        latest_frame=None,
+        latest_bev_frame=None,
+    )
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "CUDA_VISIBLE_DEVICES": env.get("CUDA_VISIBLE_DEVICES", "0,7"),
+            "SPLIT": split,
+            "N_EP": "1",
+            "VIDEO_DIR": str(video_dir),
+            "TB_DIR": str(tb_dir),
+            "LOG": str(log_path),
+            "VLFM_DUMP_RGB_DIR": str(live_dir),
+            "VLFM_DUMP_BEV_DIR": str(live_bev_dir),
+        }
+    )
+    env.update({str(k): str(v) for k, v in env_overrides.items()})
+
+    proc = subprocess.Popen(
+        ["bash", "scripts/dataset_tools/eval_cat_demo.sh"],
+        cwd=str(REPO),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    web_log = stage_root / "launcher.out"
+    with web_log.open("w", encoding="utf-8") as f:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            f.write(line)
+            f.flush()
+    exit_code = proc.wait()
+
+    latest_frame = _latest_file(live_dir, "*.png")
+    latest_bev_frame = _latest_file(live_bev_dir, "*.png")
+    latest_video = _latest_file(video_dir, "*.mp4")
+    live_video = _build_live_rgb_video(live_dir, stage_root / "live_rgb_preview.mp4")
+    changes: dict[str, Any] = {}
+    if latest_frame is not None:
+        changes["latest_frame"] = str(latest_frame)
+    if latest_bev_frame is not None:
+        changes["latest_bev_frame"] = str(latest_bev_frame)
+    if latest_video is not None:
+        changes["video_path"] = str(latest_video)
+    if live_video is not None:
+        changes["live_video_path"] = str(live_video)
+    if changes:
+        _set_run(run_id, **changes)
+
+    if exit_code != 0:
+        log_tail = _tail(log_path, 40) or _tail(web_log, 40)
+        raise RuntimeError(f"VLFM eval exited with code {exit_code} during {stage_name}.\n{log_tail}")
+    if latest_video is None:
+        raise RuntimeError(f"VLFM eval finished during {stage_name} but no mp4 was written.")
+
+    return exit_code, latest_video, live_video
+
+
+def _run_eval(run_id: str, text: str, run_mode: str, api_key: str = "") -> None:
     global active_run_id
 
     stop_watch = threading.Event()
     watcher: Optional[threading.Thread] = None
     try:
-        _set_run(run_id, status="running", stage="semantic")
-        semantic = _resolve_semantic_goal(text, api_key)
-        _set_run(run_id, label=semantic.label, confidence=semantic.confidence, reason=semantic.reason)
-        split = LABEL_TO_SPLIT.get(semantic.label or "")
-        if split is None:
-            labels = ", ".join(sorted(LABEL_TO_SPLIT))
-            raise RuntimeError(f"Resolved label is {semantic.label!r}; supported demo labels: {labels}.")
+        mode_config = RUN_MODES.get(run_mode)
+        if mode_config is None:
+            modes = ", ".join(sorted(RUN_MODES))
+            raise RuntimeError(f"Unknown run mode {run_mode!r}; supported modes: {modes}.")
+
+        if mode_config.get("semantic"):
+            _set_run(run_id, status="running", stage="semantic", label="semantic", reason="Semantic Query")
+            semantic = _resolve_semantic_goal(text, api_key)
+            split = LABEL_TO_SPLIT.get(semantic.label or "")
+            if split is None:
+                labels = ", ".join(sorted(LABEL_TO_SPLIT))
+                raise RuntimeError(f"Resolved label is {semantic.label!r}; supported demo labels: {labels}.")
+            _set_run(
+                run_id,
+                label=semantic.label,
+                confidence=semantic.confidence,
+                reason=f"Semantic Query -> {semantic.label}: {semantic.reason}",
+                stage="finding",
+            )
+        else:
+            split = str(mode_config["split"])
+            _set_run(
+                run_id,
+                status="running",
+                stage=str(mode_config["stage"]),
+                label=str(mode_config["label"]),
+                confidence=1.0,
+                reason=str(mode_config["name"]),
+            )
 
         run = _safe_run(run_id)
         run_dir = Path(run.run_dir)
-        video_dir = Path(run.video_dir)
-        tb_dir = Path(run.tb_dir)
-        live_dir = Path(run.live_dir)
-        for directory in (run_dir, video_dir, tb_dir, live_dir):
-            directory.mkdir(parents=True, exist_ok=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
 
-        _set_run(run_id, stage="finding")
         stop_watch.clear()
         watcher = threading.Thread(target=_watch_outputs, args=(run_id, stop_watch), daemon=True)
         watcher.start()
 
-        env = os.environ.copy()
-        env.update(
-            {
-                "CUDA_VISIBLE_DEVICES": env.get("CUDA_VISIBLE_DEVICES", "0,7"),
-                "SPLIT": split,
-                "N_EP": "1",
-                "VIDEO_DIR": str(video_dir),
-                "TB_DIR": str(tb_dir),
-                "LOG": str(Path(run.log_path)),
-                "VLFM_DUMP_RGB_DIR": str(live_dir),
-            }
-        )
+        if mode_config.get("paired_persistent"):
+            asset_dir = run_dir / "assets"
+            map_path = asset_dir / "cat_map.npz"
+            memory_path = asset_dir / "cat.json"
+            for stale_path in (map_path, memory_path, Path(str(map_path) + ".lock"), Path(str(memory_path) + ".lock")):
+                if stale_path.exists():
+                    stale_path.unlink()
 
-        proc = subprocess.Popen(
-            ["bash", "scripts/dataset_tools/eval_cat_demo.sh"],
-            cwd=str(REPO),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
+            paired_env = dict(mode_config["env"])
+            paired_env.update(
+                {
+                    "VLFM_PERSIST_MAP_PATH": str(map_path),
+                    "VLFM_OBJECT_MEMORY_PATH": str(memory_path),
+                }
+            )
 
-        web_log = run_dir / "launcher.out"
-        with web_log.open("w", encoding="utf-8") as f:
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                f.write(line)
-                f.flush()
-        exit_code = proc.wait()
+            _set_run(run_id, reason="Pass 1/2: find cat, save obstacle map and cat memory")
+            _run_eval_process(
+                run_id,
+                split,
+                "pass-1-build-map-memory",
+                paired_env,
+                run_dir / "pass1_build",
+            )
+            if not map_path.exists():
+                raise RuntimeError(f"Pass 1 finished but persistent map was not written: {map_path}")
+            if not memory_path.exists():
+                raise RuntimeError(f"Pass 1 finished but object memory was not written: {memory_path}")
 
-        latest_frame = _latest_file(live_dir, "*.png")
-        latest_video = _latest_file(video_dir, "*.mp4")
-        live_video = _build_live_rgb_video(live_dir, run_dir / "live_rgb_preview.mp4")
-        if latest_frame is not None:
-            _set_run(run_id, latest_frame=str(latest_frame))
-        if latest_video is not None:
-            _set_run(run_id, video_path=str(latest_video))
-        if live_video is not None:
-            _set_run(run_id, live_video_path=str(live_video))
-
-        if exit_code != 0:
-            log_tail = _tail(Path(run.log_path), 40) or _tail(web_log, 40)
-            raise RuntimeError(f"VLFM eval exited with code {exit_code}.\n{log_tail}")
-        if latest_video is None:
-            raise RuntimeError("VLFM eval finished but no mp4 was written.")
+            _set_run(run_id, reason="Pass 2/2: load obstacle map + cat memory, then A* to memory")
+            exit_code, _, _ = _run_eval_process(
+                run_id,
+                split,
+                "pass-2-load-and-a-star",
+                paired_env,
+                run_dir / "pass2_recall",
+            )
+        else:
+            stage_name = "finding" if mode_config.get("semantic") else str(mode_config["stage"])
+            exit_code, _, _ = _run_eval_process(
+                run_id,
+                split,
+                stage_name,
+                dict(mode_config["env"]),
+                run_dir,
+            )
 
         _set_run(run_id, status="complete", stage="complete", exit_code=exit_code, finished_at=time.time())
     except Exception as exc:
@@ -263,8 +441,11 @@ def create_run() -> Response:
     payload = request.get_json(silent=True) or {}
     text = str(payload.get("text", "")).strip()
     api_key = str(payload.get("api_key", "")).strip()
-    if not text:
-        return jsonify({"error": "empty request text"}), 400
+    run_mode = str(payload.get("run_mode", "find_cat")).strip() or "find_cat"
+    if run_mode not in RUN_MODES:
+        return jsonify({"error": f"unknown run mode: {run_mode}"}), 400
+    if RUN_MODES[run_mode].get("semantic") and not text:
+        return jsonify({"error": "empty semantic query"}), 400
 
     with state_lock:
         if active_run_id is not None:
@@ -273,9 +454,11 @@ def create_run() -> Response:
         run_dir = RUN_ROOT / run_id
         run = RunState(
             run_id=run_id,
-            request_text=text,
+            request_text=text or RUN_MODES[run_mode]["name"],
+            run_mode=run_mode,
             run_dir=str(run_dir),
             live_dir=str(run_dir / "live_rgb"),
+            live_bev_dir=str(run_dir / "live_bev"),
             video_dir=str(run_dir / "video"),
             tb_dir=str(run_dir / "tb"),
             log_path=str(run_dir / "vlfm.log"),
@@ -283,7 +466,7 @@ def create_run() -> Response:
         runs[run_id] = run
         active_run_id = run_id
 
-    thread = threading.Thread(target=_run_eval, args=(run_id, text, api_key), daemon=True)
+    thread = threading.Thread(target=_run_eval, args=(run_id, text, run_mode, api_key), daemon=True)
     thread.start()
     return jsonify(_serialize(run))
 
@@ -302,6 +485,15 @@ def get_run(run_id: str) -> Response:
 def latest_frame(run_id: str) -> Response:
     run = _safe_run(run_id)
     frame = Path(run.latest_frame or "")
+    if not frame.exists():
+        return Response(status=204)
+    return send_file(frame, mimetype="image/png", max_age=0)
+
+
+@app.get("/api/runs/<run_id>/latest-bev-frame")
+def latest_bev_frame(run_id: str) -> Response:
+    run = _safe_run(run_id)
+    frame = Path(run.latest_bev_frame or "")
     if not frame.exists():
         return Response(status=204)
     return send_file(frame, mimetype="image/png", max_age=0)

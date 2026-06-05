@@ -54,8 +54,15 @@ echo
 
 echo "-- pre-flight GPU usage --"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | head -1
-nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tail -n +2 | awk -F',' '
-  { gsub(/ /,""); idx=$1; if (idx==0 || idx==7) print "  GPU "$1": used="$2" free="$3 }'
+nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tail -n +2 | awk -F',' -v visible="${CUDA_VISIBLE_DEVICES}" '
+  BEGIN {
+    split(visible, gpu_ids, ",")
+    for (i in gpu_ids) {
+      gsub(/ /, "", gpu_ids[i])
+      want[gpu_ids[i]] = 1
+    }
+  }
+  { gsub(/ /,""); idx=$1; if (idx in want) print "  GPU "$1": used="$2" free="$3 }'
 
 echo "-- VLM health probes --"
 for port in 12181 12182 12183 12184; do

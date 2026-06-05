@@ -14,7 +14,10 @@ from vlfm.mapping.object_point_cloud_map import ObjectPointCloudMap
 from vlfm.mapping.obstacle_map import ObstacleMap
 from vlfm.obs_transformers.utils import image_resize
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
+from vlfm.policy.utils.waypoint_controller import step_towards
 from vlfm.utils.geometry_utils import get_fov, rho_theta
+from vlfm.utils.object_memory import recall_object, remember_object
+from vlfm.utils.path_planning import downsample_path, plan_path, rc_to_xy, snap_to_navigable, xy_to_rc
 from vlfm.vlm.blip2 import BLIP2Client
 from vlfm.vlm.coco_classes import COCO_CLASSES
 from vlfm.vlm.grounding_dino import GroundingDINOClient, ObjectDetections
@@ -29,6 +32,29 @@ except Exception:
 
     class BasePolicy:  # type: ignore
         pass
+
+
+# --- Module 3: global A* navigation (opt-in via VLFM_GLOBAL_NAV=1) ---
+# Turn step the simulator applies per discrete TURN action. cat_demo configures
+# turn_angle=30 (config/experiments/vlfm_objectnav_hm3d.yaml:29); override via env
+# if the action space changes. Used only as the controller's "is the waypoint
+# roughly ahead" threshold, so it need not be exact -- just near the real step.
+_NAV_TURN_ANGLE_RAD = float(np.deg2rad(float(os.environ.get("VLFM_NAV_TURN_ANGLE_DEG", "30"))))
+# Waypoint-reached tolerance (meters). Kept above the 0.25m forward step so the
+# controller can land inside it instead of oscillating around it.
+_NAV_ARRIVE_RADIUS = 0.4
+# Spacing (pixels @ 20px/m -> 0.6m) used to thin the dense A* path into waypoints.
+_NAV_WAYPOINT_SPACING_PX = 12
+# Replan if the goal (e.g. an object whose point cloud keeps shifting) drifts more
+# than this many meters from the goal we last planned for.
+_NAV_GOAL_DRIFT_M = 0.5
+# Periodic safety replan (in steps) to absorb newly observed obstacles/free space.
+_NAV_REPLAN_PERIOD = 25
+_NAV_STUCK_MOVE_EPS_M = 0.03
+_NAV_STUCK_STEPS = 4
+_NAV_COLLISION_MARK_RADIUS_M = 0.125
+_NAV_COLLISION_MARK_AHEAD_M = 0.35
+_NAV_STUCK_STOP_MARGIN_M = 0.15
 
 
 class BaseObjectNavPolicy(BasePolicy):
@@ -79,8 +105,20 @@ class BaseObjectNavPolicy(BasePolicy):
         self._num_steps = 0
         self._did_reset = False
         self._last_goal = np.zeros(2)
+        self._remembered_goal: Union[np.ndarray, None] = None
+        self._memory_recall_attempted = False
+        self._memory_written_this_episode = False
+        self._last_persist_save_step = -1
         self._done_initializing = False
         self._called_stop = False
+        # Module 3: global-navigation state (lazily planned by _navigate_global).
+        self._global_path: Union[List[np.ndarray], None] = None
+        self._path_goal: Union[np.ndarray, None] = None
+        self._waypoint_idx = 0
+        self._last_plan_step = 0
+        self._last_nav_robot_xy: Union[np.ndarray, None] = None
+        self._last_nav_action_id: Union[int, None] = None
+        self._nav_stuck_steps = 0
         self._compute_frontiers = compute_frontiers
         if compute_frontiers:
             self._obstacle_map = ObstacleMap(
@@ -96,11 +134,23 @@ class BaseObjectNavPolicy(BasePolicy):
         self._pointnav_policy.reset()
         self._object_map.reset()
         self._last_goal = np.zeros(2)
+        self._remembered_goal = None
+        self._memory_recall_attempted = False
+        self._memory_written_this_episode = False
+        self._last_persist_save_step = -1
         self._num_steps = 0
         self._done_initializing = False
         self._called_stop = False
+        self._global_path = None
+        self._path_goal = None
+        self._waypoint_idx = 0
+        self._last_plan_step = 0
+        self._last_nav_robot_xy = None
+        self._last_nav_action_id = None
+        self._nav_stuck_steps = 0
         if self._compute_frontiers:
             self._obstacle_map.reset()
+            self._load_persistent_obstacles()
         self._did_reset = True
 
     def act(
@@ -127,21 +177,39 @@ class BaseObjectNavPolicy(BasePolicy):
         robot_xy = self._observations_cache["robot_xy"]
         goal = self._get_target_object_location(robot_xy)
 
+        use_global = os.environ.get("VLFM_GLOBAL_NAV") == "1"
+        debug_goal = self._debug_nav_goal() if use_global else None
+
         if not self._done_initializing:  # Initialize
             mode = "initialize"
             pointnav_action = self._initialize()
-        elif goal is None:  # Haven't found target object yet
+        elif debug_goal is not None:  # Verification hook: drive to a fixed goal via A*
+            mode = "navigate-debug"
+            debug_conservative = os.environ.get("VLFM_NAV_DEBUG_CONSERVATIVE", "1") == "1"
+            pointnav_action = self._navigate_to(debug_goal, observations, conservative=debug_conservative)
+        elif goal is not None:  # Found the target object -> go to it
+            mode = "navigate"
+            pointnav_action = self._navigate_to(goal[:2], observations, conservative=False)
+        elif use_global and self._remembered_goal is not None:  # Recalled from memory (Module 2)
+            mode = "navigate-memory"
+            memory_conservative = os.environ.get("VLFM_MEMORY_NAV_CONSERVATIVE", "1") == "1"
+            pointnav_action = self._navigate_to(
+                self._remembered_goal,
+                observations,
+                conservative=memory_conservative,
+                fallback_to_pointnav=True,
+            )
+        else:  # Haven't found target object yet
             mode = "explore"
             pointnav_action = self._explore(observations)
-        else:
-            mode = "navigate"
-            pointnav_action = self._pointnav(goal[:2], stop=True)
 
         action_numpy = pointnav_action.detach().cpu().numpy()[0]
         if len(action_numpy) == 1:
             action_numpy = action_numpy[0]
         print(f"Step: {self._num_steps} | Mode: {mode} | Action: {action_numpy}")
         self._policy_info.update(self._get_policy_info(detections[0]))
+        self._maybe_remember_object(goal)
+        self._maybe_save_persistent_obstacles()
         self._num_steps += 1
 
         self._observations_cache = {}
@@ -154,6 +222,7 @@ class BaseObjectNavPolicy(BasePolicy):
         if not self._did_reset and masks[0] == 0:
             self._reset()
             self._target_object = observations["objectgoal"]
+            self._maybe_recall_object_memory()
         try:
             self._cache_observations(observations)
         except IndexError as e:
@@ -173,6 +242,64 @@ class BaseObjectNavPolicy(BasePolicy):
             return self._object_map.get_best_object(self._target_object, position)
         else:
             return None
+
+    def _maybe_recall_object_memory(self) -> None:
+        if self._memory_recall_attempted:
+            return
+        self._memory_recall_attempted = True
+
+        path = os.environ.get("VLFM_OBJECT_MEMORY_PATH")
+        if not path or not self._target_object:
+            return
+
+        remembered_goal = recall_object(path, self._target_object)
+        if remembered_goal is None:
+            return
+
+        self._remembered_goal = remembered_goal
+        print(f"[memory] recalled {self._target_object} at {remembered_goal.tolist()} from {path}")
+
+    def _maybe_remember_object(self, goal: Union[None, np.ndarray]) -> None:
+        path = os.environ.get("VLFM_OBJECT_MEMORY_PATH")
+        if (
+            not path
+            or self._memory_written_this_episode
+            or not self._called_stop
+            or goal is None
+            or not self._target_object
+        ):
+            return
+
+        remember_object(path, self._target_object, goal[:2], start_pose=self._get_memory_start_pose())
+        self._memory_written_this_episode = True
+        print(f"[memory] remembered {self._target_object} at {goal[:2].tolist()} in {path}")
+
+    def _load_persistent_obstacles(self) -> None:
+        path = os.environ.get("VLFM_PERSIST_MAP_PATH")
+        if not path or not self._compute_frontiers:
+            return
+        loaded_px = self._obstacle_map.load_and_merge(path)
+        if loaded_px > 0:
+            print(f"[persist] loaded {loaded_px} obstacle px from {path}")
+
+    def _maybe_save_persistent_obstacles(self) -> None:
+        path = os.environ.get("VLFM_PERSIST_MAP_PATH")
+        if not path or not self._compute_frontiers:
+            return
+        if not self._called_stop and self._num_steps % int(os.environ.get("VLFM_PERSIST_SAVE_PERIOD", "10")) != 0:
+            return
+        if self._last_persist_save_step == self._num_steps:
+            return
+        self._obstacle_map.save(path, start_pose=self._get_memory_start_pose())
+        self._last_persist_save_step = self._num_steps
+        print(f"[persist] saved {int(self._obstacle_map._map.sum())} obstacle px to {path}")
+
+    def _get_memory_start_pose(self) -> List[float]:
+        start_yaw = self._observations_cache.get(
+            "habitat_start_yaw",
+            self._observations_cache.get("robot_heading", 0.0),
+        )
+        return [0.0, 0.0, float(start_yaw)]
 
     def _get_policy_info(self, detections: ObjectDetections) -> Dict[str, Any]:
         if self._object_map.has_object(self._target_object):
@@ -277,6 +404,223 @@ class BaseObjectNavPolicy(BasePolicy):
             return self._stop_action
         action = self._pointnav_policy.act(obs_pointnav, masks, deterministic=True)
         return action
+
+    def _debug_nav_goal(self) -> Union[np.ndarray, None]:
+        """Verification hook (Module 3). If ``VLFM_NAV_DEBUG_GOAL="x,y"`` is set,
+        return that episodic goal -- but only once ``self._num_steps`` reaches
+        ``VLFM_NAV_DEBUG_AFTER`` (default 0), so the robot can first explore away
+        from the origin before being driven (back) to the goal."""
+        raw = os.environ.get("VLFM_NAV_DEBUG_GOAL")
+        if not raw:
+            return None
+        if self._num_steps < int(os.environ.get("VLFM_NAV_DEBUG_AFTER", "0")):
+            return None
+        try:
+            x, y = (float(v) for v in raw.split(",")[:2])
+        except ValueError:
+            print(f"[nav] ignoring malformed VLFM_NAV_DEBUG_GOAL={raw!r}")
+            return None
+        return np.array([x, y], dtype=np.float64)
+
+    def _navigate_to(
+        self,
+        goal_xy: np.ndarray,
+        observations: "TensorDict",
+        conservative: bool = False,
+        fallback_to_pointnav: bool = False,
+    ) -> Tensor:
+        """Navigate toward ``goal_xy``. With ``VLFM_GLOBAL_NAV=1`` this plans an
+        A* path on the obstacle map and follows it; otherwise it preserves the
+        original ``_pointnav(goal, stop=True)`` behavior. If global planning finds
+        no navigable path, falls back to frontier exploration."""
+        goal_xy = np.asarray(goal_xy, dtype=np.float64)[:2]
+        if os.environ.get("VLFM_GLOBAL_NAV") != "1":
+            return self._pointnav(goal_xy, stop=True)
+        action = self._navigate_global(goal_xy, conservative=conservative)
+        if action is not None:
+            return action
+        if fallback_to_pointnav:
+            print("[nav] no global path found, falling back to PointNav toward remembered goal")
+            return self._pointnav(goal_xy, stop=True)
+        # A* found no navigable path (truly walled in) -> fall back to exploring.
+        print("[nav] no global path found, falling back to exploration")
+        return self._explore(observations)
+
+    def _navigate_global(self, goal_xy: np.ndarray, conservative: bool = False) -> Union[Tensor, None]:
+        """Plan (and cache) an A* path to ``goal_xy`` on the obstacle map and emit
+        the next discrete action via the geometric waypoint controller.
+
+        Args:
+            goal_xy: Episodic ``(x, y)`` goal in meters.
+            conservative: If True, only traverse already-explored free space
+                (``_navigable_map & explored_area``) -- used for returning to a
+                remembered/home point. If False, treat unseen cells as navigable
+                (optimistic) -- used for charging a freshly detected object.
+
+        Returns:
+            A discrete action tensor, the STOP action once within
+            ``_pointnav_stop_radius`` of the goal, or ``None`` if no navigable
+            path exists (caller should fall back to exploration).
+        """
+        robot_xy = self._observations_cache["robot_xy"]
+        heading = self._observations_cache["robot_heading"]
+        self._last_goal = goal_xy  # surfaces the goal marker in the value-map viz
+        force_replan = self._update_nav_stuck_state(robot_xy, heading)
+
+        # Stop once we are close enough to the actual goal.
+        rho_goal, _ = rho_theta(robot_xy, heading, goal_xy)
+        if rho_goal < self._pointnav_stop_radius:
+            self._called_stop = True
+            return self._remember_nav_action(self._stop_action, robot_xy)
+        if (
+            not conservative
+            and force_replan
+            and rho_goal < self._pointnav_stop_radius + _NAV_STUCK_STOP_MARGIN_M
+        ):
+            self._called_stop = True
+            print(
+                "[nav-stuck] "
+                f"stopping near target after repeated blocked forward actions; rho_goal={rho_goal:.3f}",
+                flush=True,
+            )
+            return self._remember_nav_action(self._stop_action, robot_xy)
+
+        navigable = self._obstacle_map._navigable_map.astype(bool)
+        if conservative:
+            navigable = navigable & self._obstacle_map.explored_area.astype(bool)
+
+        if force_replan or self._needs_replan(goal_xy, navigable):
+            path_xy = self._plan_path_xy(robot_xy, goal_xy, navigable)
+            if path_xy is None:
+                self._global_path = None
+                return None
+            self._global_path = path_xy
+            self._path_goal = goal_xy
+            self._waypoint_idx = 0
+            self._last_plan_step = self._num_steps
+
+        # Skip past any waypoints we have already reached.
+        while self._waypoint_idx < len(self._global_path):
+            if rho_theta(robot_xy, heading, self._global_path[self._waypoint_idx])[0] < _NAV_ARRIVE_RADIUS:
+                self._waypoint_idx += 1
+            else:
+                break
+
+        if self._waypoint_idx >= len(self._global_path):
+            # Reached the end of the path but still outside the stop radius (the
+            # goal was snapped onto/just outside an obstacle). Best effort: stop.
+            self._called_stop = True
+            return self._stop_action
+
+        action = step_towards(
+            self._global_path[self._waypoint_idx],
+            robot_xy,
+            heading,
+            _NAV_TURN_ANGLE_RAD,
+            _NAV_ARRIVE_RADIUS,
+        )
+        if action is None:  # defensive: already-reached waypoints were skipped above
+            self._called_stop = True
+            return self._remember_nav_action(self._stop_action, robot_xy)
+        if os.environ.get("VLFM_NAV_DEBUG_LOG") == "1":
+            rho_wp, theta_wp = rho_theta(robot_xy, heading, self._global_path[self._waypoint_idx])
+            print(
+                "[nav] "
+                f"xy={np.round(robot_xy, 3).tolist()} "
+                f"goal={np.round(goal_xy, 3).tolist()} "
+                f"wp_idx={self._waypoint_idx}/{len(self._global_path)} "
+                f"wp={np.round(self._global_path[self._waypoint_idx], 3).tolist()} "
+                f"rho_wp={rho_wp:.3f} theta_wp={theta_wp:.3f} "
+                f"rho_goal={rho_goal:.3f} stuck={self._nav_stuck_steps}",
+                flush=True,
+            )
+        return self._remember_nav_action(action, robot_xy)
+
+    def _remember_nav_action(self, action: Tensor, robot_xy: np.ndarray) -> Tensor:
+        self._last_nav_robot_xy = np.asarray(robot_xy, dtype=np.float64).copy()
+        try:
+            self._last_nav_action_id = int(action.detach().cpu().numpy()[0][0])
+        except Exception:
+            self._last_nav_action_id = None
+        return action
+
+    def _update_nav_stuck_state(self, robot_xy: np.ndarray, heading: float) -> bool:
+        if self._last_nav_action_id != 1 or self._last_nav_robot_xy is None:
+            self._nav_stuck_steps = 0
+            return False
+
+        moved = float(np.linalg.norm(np.asarray(robot_xy, dtype=np.float64) - self._last_nav_robot_xy))
+        if moved >= _NAV_STUCK_MOVE_EPS_M:
+            self._nav_stuck_steps = 0
+            return False
+
+        self._nav_stuck_steps += 1
+        if self._nav_stuck_steps < _NAV_STUCK_STEPS:
+            return False
+
+        self._mark_collision_ahead(robot_xy, heading)
+        self._mark_current_waypoint_blocked()
+        self._global_path = None
+        self._nav_stuck_steps = 0
+        print(
+            "[nav-stuck] "
+            f"forward moved only {moved:.3f}m near xy={np.round(robot_xy, 3).tolist()}; "
+            "marked a local obstacle ahead and will replan",
+            flush=True,
+        )
+        return True
+
+    def _mark_collision_ahead(self, robot_xy: np.ndarray, heading: float) -> None:
+        forward = np.array([np.cos(heading), np.sin(heading)], dtype=np.float64)
+        blocked_xy = np.asarray(robot_xy, dtype=np.float64) + forward * _NAV_COLLISION_MARK_AHEAD_M
+        self._mark_obstacle_disk(blocked_xy, _NAV_COLLISION_MARK_RADIUS_M)
+
+    def _mark_current_waypoint_blocked(self) -> None:
+        if self._global_path is None or self._waypoint_idx >= len(self._global_path):
+            return
+        self._mark_obstacle_disk(self._global_path[self._waypoint_idx], _NAV_COLLISION_MARK_RADIUS_M)
+
+    def _mark_obstacle_disk(self, center_xy: np.ndarray, radius_m: float) -> None:
+        blocked_rc = xy_to_rc(self._obstacle_map, np.asarray(center_xy, dtype=np.float64))
+        radius_px = max(1, int(round(radius_m * self._obstacle_map.pixels_per_meter)))
+        rr, cc = np.ogrid[: self._obstacle_map._map.shape[0], : self._obstacle_map._map.shape[1]]
+        mask = (rr - blocked_rc[0]) ** 2 + (cc - blocked_rc[1]) ** 2 <= radius_px**2
+        self._obstacle_map._map[mask] = 1
+        self._obstacle_map._recompute_navigable()
+        self._obstacle_map.explored_area[self._obstacle_map._navigable_map == 0] = 0
+
+    def _needs_replan(self, goal_xy: np.ndarray, navigable: np.ndarray) -> bool:
+        """Decide whether to recompute the global path this step (vs. keep following
+        the cached one)."""
+        if self._global_path is None or self._path_goal is None:
+            return True
+        if self._waypoint_idx >= len(self._global_path):
+            return True
+        if np.linalg.norm(goal_xy - self._path_goal) > _NAV_GOAL_DRIFT_M:
+            return True
+        if self._num_steps - self._last_plan_step >= _NAV_REPLAN_PERIOD:
+            return True
+        # The waypoint we are currently steering toward turned non-navigable under
+        # the latest observation (a newly seen obstacle).
+        r, c = xy_to_rc(self._obstacle_map, self._global_path[self._waypoint_idx])
+        return not navigable[r, c]
+
+    def _plan_path_xy(
+        self, robot_xy: np.ndarray, goal_xy: np.ndarray, navigable: np.ndarray
+    ) -> Union[List[np.ndarray], None]:
+        """Plan start->goal on ``navigable``, returning a thinned list of waypoint
+        ``(x, y)`` points, or ``None`` if no navigable path exists."""
+        if not navigable.any():
+            return None
+        start_rc = snap_to_navigable(navigable, xy_to_rc(self._obstacle_map, robot_xy))
+        goal_rc = snap_to_navigable(navigable, xy_to_rc(self._obstacle_map, goal_xy))
+        if start_rc is None or goal_rc is None:
+            return None
+        path_rc = plan_path(navigable, start_rc, goal_rc)
+        if path_rc is None:
+            return None
+        path_rc = downsample_path(path_rc, _NAV_WAYPOINT_SPACING_PX)
+        return [rc_to_xy(self._obstacle_map, rc) for rc in path_rc]
 
     def _update_object_map(
         self,

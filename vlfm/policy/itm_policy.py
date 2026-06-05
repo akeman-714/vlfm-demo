@@ -108,7 +108,7 @@ class BaseITMPolicy(BaseObjectNavPolicy):
                     break
 
             if curr_index is None:
-                closest_index = closest_point_within_threshold(sorted_pts, self._last_frontier, threshold=0.5)
+                closest_index = closest_point_within_threshold(sorted_pts, self._last_frontier, threshold=1.5)
 
                 if closest_index != -1:
                     # There is a point close to the last point pursued
@@ -116,7 +116,7 @@ class BaseITMPolicy(BaseObjectNavPolicy):
 
             if curr_index is not None:
                 curr_value = sorted_values[curr_index]
-                if curr_value + 0.01 > self._last_value:
+                if curr_value + 0.05 > self._last_value:
                     # The last point pursued is still in the list of frontiers and its
                     # value is not much worse than self._last_value
                     print("Sticking to last point.")

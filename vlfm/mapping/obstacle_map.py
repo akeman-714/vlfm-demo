@@ -1,6 +1,9 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
-from typing import Any, Union
+import os
+import time
+from pathlib import Path
+from typing import Any, Optional, Sequence, Union
 
 import cv2
 import numpy as np
@@ -52,6 +55,62 @@ class ObstacleMap(BaseMap):
         self._frontiers_px = np.array([])
         self.frontiers = np.array([])
 
+    def _recompute_navigable(self) -> None:
+        """Rebuild the robot-radius-padded navigable map from the obstacle map."""
+        self._navigable_map = 1 - cv2.dilate(
+            self._map.astype(np.uint8),
+            self._navigable_kernel,
+            iterations=1,
+        ).astype(bool)
+
+    def save(self, path: Union[str, os.PathLike[str]], start_pose: Optional[Sequence[float]] = None) -> None:
+        """Persist the monotonic obstacle grid and a small compatibility header."""
+        map_path = Path(path)
+        map_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = map_path.with_name(f".{map_path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            with tmp_path.open("wb") as f:
+                np.savez_compressed(
+                    f,
+                    obstacle_map=self._map.astype(bool),
+                    size=np.array([self.size], dtype=np.int64),
+                    pixels_per_meter=np.array([self.pixels_per_meter], dtype=np.int64),
+                    start_pose=np.asarray(start_pose if start_pose is not None else [], dtype=np.float64),
+                    ts=np.array([time.time()], dtype=np.float64),
+                )
+            os.replace(tmp_path, map_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+    def load_and_merge(self, path: Union[str, os.PathLike[str]]) -> int:
+        """Load a persisted obstacle grid, OR it into this map, and return loaded pixels."""
+        map_path = Path(path)
+        if not map_path.exists():
+            return 0
+
+        try:
+            with np.load(map_path, allow_pickle=False) as data:
+                loaded_size = int(np.asarray(data["size"]).reshape(-1)[0])
+                loaded_ppm = int(np.asarray(data["pixels_per_meter"]).reshape(-1)[0])
+                loaded_map = np.asarray(data["obstacle_map"], dtype=bool)
+        except (KeyError, OSError, ValueError) as e:
+            print(f"[persist] could not read {map_path}: {e}")
+            return 0
+
+        if loaded_size != self.size or loaded_ppm != self.pixels_per_meter or loaded_map.shape != self._map.shape:
+            print(
+                "[persist] skipped incompatible map "
+                f"{map_path}: size={loaded_size}, ppm={loaded_ppm}, shape={loaded_map.shape}; "
+                f"expected size={self.size}, ppm={self.pixels_per_meter}, shape={self._map.shape}"
+            )
+            return 0
+
+        loaded_count = int(loaded_map.sum())
+        self._map |= loaded_map
+        self._recompute_navigable()
+        return loaded_count
+
     def update_map(
         self,
         depth: Union[np.ndarray, Any],
@@ -102,11 +161,7 @@ class ObstacleMap(BaseMap):
 
             # Update the navigable area, which is an inverse of the obstacle map after a
             # dilation operation to accommodate the robot's radius.
-            self._navigable_map = 1 - cv2.dilate(
-                self._map.astype(np.uint8),
-                self._navigable_kernel,
-                iterations=1,
-            ).astype(bool)
+            self._recompute_navigable()
 
         if not explore:
             return
