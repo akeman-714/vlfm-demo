@@ -1,0 +1,91 @@
+digraph VLFM {
+    rankdir=TB;
+    compound=true;
+    graph [fontname="Noto Sans CJK SC", fontsize=15, labelloc="t",
+           label="VLFM 零样本目标物体导航 · 单步处理架构",
+           nodesep=0.40, ranksep=0.55, bgcolor="white"];
+    node  [fontname="Noto Sans CJK SC", fontsize=12, shape=box,
+           style="rounded,filled", color="#666666", penwidth=1.2];
+    edge  [fontname="Noto Sans CJK SC", fontsize=10, color="#444444"];
+
+    // ===== ① 输入 =====
+    subgraph cluster_input {
+        label="① 每步传感器输入";
+        style="rounded,filled"; fillcolor="#EAF2FB"; color="#3B6EA5"; fontsize=13;
+        depth [label="深度图", fillcolor="#D6E6F7"];
+        pose  [label="位姿\n(位置 + 朝向)", fillcolor="#D6E6F7"];
+        rgb   [label="RGB 彩色图", fillcolor="#D6E6F7"];
+        {rank=same; depth; pose; rgb;}
+        depth -> pose -> rgb [style=invis];
+    }
+
+    // ===== ② 感知与建图（三条线并行）=====
+    subgraph cluster_perc {
+        label="② 感知与建图（三条线并行）";
+        style="rounded,filled"; fillcolor="#F7F7F2"; color="#8A8A66"; fontsize=13;
+
+        subgraph cluster_b1 {
+            label="几何线"; fontsize=11; fontcolor="#5E8A4E";
+            style="rounded,dashed"; color="#7BA86B"; penwidth=1.4;
+            geo      [label="几何俯视图\n障碍 / 可通行 / 已探索", fillcolor="#D9EBD3"];
+            frontier [label="探索边界 frontier\n(候选探索方向)", fillcolor="#C7E0BC"];
+            geo -> frontier;
+        }
+        subgraph cluster_b2 {
+            label="价值线（核心）"; fontsize=11; fontcolor="#B5701F";
+            style="rounded,dashed"; color="#D98A2B"; penwidth=1.8;
+            vlm   [label="视觉-语言模型 (BLIP-2)\n目标词 × 画面 → 相关性打分", fillcolor="#FCE3C2"];
+            value [label="价值热力图\n扇形投影 + 置信度加权累积", fillcolor="#F9D199"];
+            vlm -> value;
+        }
+        subgraph cluster_b3 {
+            label="检测线"; fontsize=11; fontcolor="#7A5C99";
+            style="rounded,dashed"; color="#9B7CB8"; penwidth=1.4;
+            det    [label="检测 + 分割\n(YOLOv7 / GroundingDINO + SAM)", fillcolor="#E6DAF0"];
+            objloc [label="目标 3D 定位\n(检测框 + 深度反投影)", fillcolor="#D8C4EC"];
+            det -> objloc;
+        }
+
+        // 三条子线左右顺序：几何 | 价值 | 检测
+        geo -> vlm -> det [style=invis];
+    }
+
+    // ===== ③ 决策（状态机）=====
+    subgraph cluster_dec {
+        label="③ 决策（状态机）";
+        style="rounded,filled"; fillcolor="#FBEEEE"; color="#A5443B"; fontsize=13;
+        found    [label="已找到目标？", shape=diamond, fillcolor="#F5CFCB"];
+        explore  [label="探索模式\n选价值最高的边界\n(+ 防横跳 / 防绕圈)", fillcolor="#F3D7D3"];
+        navigate [label="导航模式\n直奔目标，够近即停", fillcolor="#F3D7D3"];
+        {rank=same; explore; navigate;}
+    }
+
+    // ===== ④ 底层运动 =====
+    subgraph cluster_low {
+        label="④ 底层运动（预训练 · 独立模块）";
+        style="rounded,filled"; fillcolor="#EFEFEF"; color="#666666"; fontsize=13;
+        pointnav [label="PointNav 策略\n目标点(x,y) → 速度 / 转向", fillcolor="#DDDDDD"];
+        robot    [label="机器人执行\n前进 / 转向", fillcolor="#CCCCCC"];
+        pointnav -> robot;
+    }
+
+    // ===== 跨层数据流 =====
+    rgb   -> vlm;
+    rgb   -> det;
+    depth -> geo;
+    pose  -> geo;
+
+    frontier -> explore [label="候选边界"];
+    value    -> explore [label="打分排序"];
+    objloc   -> found   [label="目标坐标"];
+
+    found -> navigate [label="是"];
+    found -> explore  [label="否"];
+
+    explore  -> pointnav [label="去最高分边界"];
+    navigate -> pointnav [label="去目标点"];
+
+    // 闭环：执行后进入下一步
+    robot -> rgb [label="下一步循环", style=dashed, constraint=false,
+                  color="#3B6EA5", fontcolor="#3B6EA5"];
+}

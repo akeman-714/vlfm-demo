@@ -27,7 +27,7 @@
 ```bash
 # 验收 1（回家绕墙）：先探索 40 步，再 A* 回出生点 (0,0)，保守图（只走已探索空地）
 VLFM_GLOBAL_NAV=1 VLFM_NAV_DEBUG_GOAL=0,0 VLFM_NAV_DEBUG_AFTER=40 \
-  bash scripts/dataset_tools/eval_cat_demo.sh
+  bash scripts/cat_demo/eval_cat_demo.sh
 # 验收 2（目标压障碍上）：把 DEBUG_GOAL 设到一个已知墙体里的点，应 snap+STOP，不报错
 # 验收 3（未探索/不连通）：把 DEBUG_GOAL 设到远处未探索点，乐观给路、边走边 replan
 # 验收 4（回归）：不设 VLFM_GLOBAL_NAV → navigate 分支仍走原 _pointnav(goal, stop=True)

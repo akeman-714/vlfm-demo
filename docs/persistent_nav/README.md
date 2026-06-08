@@ -32,8 +32,8 @@
 
 ## 0.2 ⚠️ 贯穿三模块的运行时事实：每次 Run = 独立子进程 + 单 episode
 
-- web 入口 `scripts/dataset_tools/semantic_cat_web.py` 的 `_run_eval` **每次点 Run 都 spawn 新的 `python -m vlfm.run`**；
-  `scripts/dataset_tools/eval_cat_demo.sh` 里 `N_EP=1`。
+- web 入口 `scripts/cat_demo/web.py` 的 `_run_eval` **每次点 Run 都 spawn 新的 `python -m vlfm.run`**；
+  `scripts/cat_demo/eval_cat_demo.sh` 里 `N_EP=1`。
 - 推论 A：**跨集复用 = 跨进程复用 = 只能走文件**（内存状态每进程销毁）。
 - 推论 B：`_reset()` 在 N_EP=1 时**只触发一次**，没有「下一次 reset 顺手存上一集图」的机会。
   → **模块 1/2 的「写盘」必须发生在 episode 进行中（周期性）或 STOP 时，不能挂在 next-reset。**
@@ -63,7 +63,7 @@
 | `VLFM_OBJECT_MEMORY_PATH` | 设置后启用模块 2：物体记忆 json 路径 | 未设=关闭 |
 | `VLFM_GLOBAL_NAV` | `=1` 启用模块 3：navigate 分支走 A\*+控制器；否则保持原 `_pointnav` | 未设=关闭 |
 
-`scripts/dataset_tools/eval_cat_demo.sh` 里 export 这些变量即可逐模块开启，方便单独验收。
+`scripts/cat_demo/eval_cat_demo.sh` 里 export 这些变量即可逐模块开启，方便单独验收。
 
 ---
 
@@ -78,7 +78,7 @@
 
 ```bash
 # 单跑一集，产出视频到 video_dir/cat_demo_<时间戳>/
-bash scripts/dataset_tools/eval_cat_demo.sh
-# 或 web： bash scripts/dataset_tools/semantic_cat_web.sh
+bash scripts/cat_demo/eval_cat_demo.sh
+# 或 web： bash scripts/cat_demo/web.sh
 ```
 每个模块文档末尾给出该模块**具体**的观察点与通过标准。

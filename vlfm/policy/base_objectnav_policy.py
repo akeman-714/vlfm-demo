@@ -464,8 +464,20 @@ class BaseObjectNavPolicy(BasePolicy):
         """
         robot_xy = self._observations_cache["robot_xy"]
         heading = self._observations_cache["robot_heading"]
-        self._last_goal = goal_xy  # surfaces the goal marker in the value-map viz
-        force_replan = self._update_nav_stuck_state(robot_xy, heading)
+        # VLFM_GLOBAL_NAV_FOLLOWER selects how A* waypoints are driven:
+        # "geometric" (default) uses the turn-then-forward controller; "pointnav"
+        # hands each waypoint to the trained PointNav policy for learned local
+        # obstacle avoidance.
+        use_pointnav_follower = os.environ.get("VLFM_GLOBAL_NAV_FOLLOWER", "geometric") == "pointnav"
+        if use_pointnav_follower:
+            # PointNav avoids obstacles from live depth, so we skip the geometric
+            # stuck detector and its obstacle-marking (which would otherwise write
+            # spurious obstacles into the persistent map). Let _pointnav own
+            # _last_goal so its RNN resets only when the waypoint advances.
+            force_replan = False
+        else:
+            self._last_goal = goal_xy  # surfaces the goal marker in the value-map viz
+            force_replan = self._update_nav_stuck_state(robot_xy, heading)
 
         # Stop once we are close enough to the actual goal.
         rho_goal, _ = rho_theta(robot_xy, heading, goal_xy)
@@ -512,8 +524,31 @@ class BaseObjectNavPolicy(BasePolicy):
             self._called_stop = True
             return self._stop_action
 
+        next_wp = self._global_path[self._waypoint_idx]
+        if os.environ.get("VLFM_NAV_DEBUG_LOG") == "1":
+            rho_wp, theta_wp = rho_theta(robot_xy, heading, next_wp)
+            follower = "pointnav" if use_pointnav_follower else "geometric"
+            print(
+                "[nav] "
+                f"follower={follower} "
+                f"xy={np.round(robot_xy, 3).tolist()} "
+                f"goal={np.round(goal_xy, 3).tolist()} "
+                f"wp_idx={self._waypoint_idx}/{len(self._global_path)} "
+                f"wp={np.round(next_wp, 3).tolist()} "
+                f"rho_wp={rho_wp:.3f} theta_wp={theta_wp:.3f} "
+                f"rho_goal={rho_goal:.3f} stuck={self._nav_stuck_steps}",
+                flush=True,
+            )
+        if use_pointnav_follower:
+            # A* sets the intermediate waypoint; the trained PointNav policy drives
+            # to it with learned local obstacle avoidance. stop=False so it never
+            # emits STOP at an intermediate waypoint -- the final STOP is the
+            # rho_goal check above. _pointnav owns _last_goal, so its RNN resets
+            # only when the waypoint actually advances (not every step).
+            return self._pointnav(next_wp, stop=False)
+
         action = step_towards(
-            self._global_path[self._waypoint_idx],
+            next_wp,
             robot_xy,
             heading,
             _NAV_TURN_ANGLE_RAD,
@@ -522,18 +557,6 @@ class BaseObjectNavPolicy(BasePolicy):
         if action is None:  # defensive: already-reached waypoints were skipped above
             self._called_stop = True
             return self._remember_nav_action(self._stop_action, robot_xy)
-        if os.environ.get("VLFM_NAV_DEBUG_LOG") == "1":
-            rho_wp, theta_wp = rho_theta(robot_xy, heading, self._global_path[self._waypoint_idx])
-            print(
-                "[nav] "
-                f"xy={np.round(robot_xy, 3).tolist()} "
-                f"goal={np.round(goal_xy, 3).tolist()} "
-                f"wp_idx={self._waypoint_idx}/{len(self._global_path)} "
-                f"wp={np.round(self._global_path[self._waypoint_idx], 3).tolist()} "
-                f"rho_wp={rho_wp:.3f} theta_wp={theta_wp:.3f} "
-                f"rho_goal={rho_goal:.3f} stuck={self._nav_stuck_steps}",
-                flush=True,
-            )
         return self._remember_nav_action(action, robot_xy)
 
     def _remember_nav_action(self, action: Tensor, robot_xy: np.ndarray) -> Tensor:

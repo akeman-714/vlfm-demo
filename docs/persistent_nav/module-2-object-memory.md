@@ -9,7 +9,7 @@ cat_demo 单 start → 存的 episodic 点下集直接可用。
 
 ## 交付物 & 验收标准
 
-- [ ] `VLFM_OBJECT_MEMORY_PATH=data/object_memory/cat.json bash scripts/dataset_tools/eval_cat_demo.sh` 跑一次。
+- [ ] `VLFM_OBJECT_MEMORY_PATH=data/object_memory/cat.json bash scripts/cat_demo/eval_cat_demo.sh` 跑一次。
 - [ ] **验收 1**：跑完 json 存在，含 `{"cat": {"xy": [x, y], "start_pose": [...], "ts": ...}}`，`xy` 与视频里猫的位置吻合（量级对、不是 0,0）。
 - [ ] **验收 2**：第二次跑，reset 后打印 `[memory] recalled cat at [x, y]`，且 `self._remembered_goal` 被正确填充。
 - [ ] **验收 3（回归）**：不设 `VLFM_OBJECT_MEMORY_PATH` 时行为与现状一致。

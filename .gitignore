@@ -187,14 +187,10 @@ GroundingDINO/
 __pycache__/
 *.pyc
 
-# Local experimental outputs - by default ignore everything under outputs/
-# (probe logs, intermediate per-step frames, run logs from the split-GPU
-# launcher) except the curated demo media that documents the canonical
-# HabitatITMPolicyV2 split-GPU run.
+# Local experimental outputs. These are grouped by run content in scripts, but
+# remain local-only artifacts: Hydra configs, logs, TensorBoard events, frames,
+# generated videos, and web/probe run directories.
 outputs/*
-!outputs/vlfm_itm_video_demo/
-!outputs/vlfm_itm_video_demo/*.png
-!outputs/vlfm_itm_video_demo/*.mp4
 
 # Runtime artifacts and downloaded weights / datasets that live inside the repo
 # dir for convenience. Keep most large local data out of git, but allow the
@@ -204,6 +200,9 @@ outputs/*
 /video_dir/
 /traced_model.pt
 /yolov7/
+/data/object_memory/
+/data/persistent_maps/
+/data/cat_demo_assets/
 /data/datasets/*
 !/data/datasets/objectnav/
 /data/datasets/objectnav/*
@@ -213,6 +212,7 @@ outputs/*
 /data/datasets/objectnav/hm3d/v1/*
 !/data/datasets/objectnav/hm3d/v1/cat_demo/
 !/data/datasets/objectnav/hm3d/v1/cat_demo/**
+/data/datasets/objectnav/hm3d/v1/cat_demo/content/*.json
 /data/scene_datasets/*
 !/data/scene_datasets/hm3d/
 /data/scene_datasets/hm3d/*

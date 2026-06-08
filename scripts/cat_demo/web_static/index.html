@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ObjectNav Run Console</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="topbar">
+        <div>
+          <h1>ObjectNav Run Console</h1>
+          <p id="runLine">idle</p>
+        </div>
+        <div class="status-pills">
+          <span id="stagePill">ready</span>
+          <span id="labelPill">label: -</span>
+        </div>
+      </section>
+
+      <form id="requestForm" class="command-row">
+        <div class="form-fields">
+          <select id="runMode" name="runMode">
+            <option value="semantic_query">Semantic query</option>
+            <option value="find_cat">Find cat</option>
+            <option value="global_home_40">Global home (after 40 steps)</option>
+            <option value="global_home_100">Global home (after 100 steps)</option>
+            <option value="object_memory_cat">Object memory cat (module 2 + 3)</option>
+            <option value="persistent_memory_cat_pair">Persistent map + memory cat (2 passes)</option>
+            <option value="persistent_memory_cat_pair_pointnav">Persistent map + memory cat — PointNav follower (2 passes)</option>
+          </select>
+          <input id="requestText" name="requestText" value="咪咪在哪里" autocomplete="off" />
+          <input id="apiKey" name="apiKey" type="password" autocomplete="off" placeholder="API key for semantic query" />
+        </div>
+        <button id="runButton" type="submit">Run</button>
+      </form>
+
+      <section class="workspace">
+        <div class="live-grid">
+          <div class="viewer">
+            <div class="viewer-head">
+              <span>Live RGB</span>
+              <span id="elapsed">0.0s</span>
+            </div>
+            <div class="frame-box">
+              <img id="liveFrame" alt="" />
+              <div id="frameEmpty" class="empty">waiting</div>
+            </div>
+          </div>
+
+          <div class="viewer">
+            <div class="viewer-head">
+              <span>Live BEV</span>
+              <span id="bevState">map</span>
+            </div>
+            <div class="frame-box">
+              <img id="liveBevFrame" alt="" />
+              <div id="bevFrameEmpty" class="empty">waiting</div>
+            </div>
+          </div>
+        </div>
+
+        <aside class="side">
+          <div class="panel">
+            <dl>
+              <div>
+                <dt>Status</dt>
+                <dd id="statusText">idle</dd>
+              </div>
+              <div>
+                <dt>Mode</dt>
+                <dd id="semanticText">-</dd>
+              </div>
+              <div>
+                <dt>Video</dt>
+                <dd id="videoText">-</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="panel log-panel">
+            <pre id="logText"></pre>
+          </div>
+        </aside>
+      </section>
+
+      <section id="videoSection" class="video-section hidden">
+        <div class="viewer-head">
+          <span>Saved MP4</span>
+          <a id="videoLink" href="#">open</a>
+        </div>
+        <video id="resultVideo" controls playsinline></video>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

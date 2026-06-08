@@ -9,7 +9,7 @@ cat_demo 单 start → episodic 帧恒等，**零变换对齐**。
 
 ## 交付物 & 验收标准
 
-- [ ] `VLFM_PERSIST_MAP_PATH=data/persistent_maps/cat.npz bash scripts/dataset_tools/eval_cat_demo.sh` 连跑两次。
+- [ ] `VLFM_PERSIST_MAP_PATH=data/persistent_maps/cat.npz bash scripts/cat_demo/eval_cat_demo.sh` 连跑两次。
 - [ ] **验收 1**：第一次跑完，该 npz 存在且 `_map.sum() > 0`。
 - [ ] **验收 2**：第二次跑的 **step 0**，`self._obstacle_map._map.sum() > 0`（开局即带障碍）。打印一行 `[persist] loaded N obstacle px` 佐证。
 - [ ] **验收 3**：第二次跑的 `obstacle_map.visualize()`（视频左图/`policy_info["obstacle_map"]`）开局就有黑色障碍，而非全白。

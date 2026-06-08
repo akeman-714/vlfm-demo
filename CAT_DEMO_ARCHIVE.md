@@ -15,7 +15,7 @@ The archived demo data is intentionally small:
 The web entrypoint is:
 
 ```bash
-bash scripts/dataset_tools/semantic_cat_web.sh
+bash scripts/cat_demo/web.sh
 ```
 
 Runtime expectations:
@@ -32,5 +32,5 @@ git clone git@github.com:akeman-714/vlfm-demo.git
 cd vlfm-demo
 git checkout cat-demo-working-20260605
 git lfs pull
-bash scripts/dataset_tools/semantic_cat_web.sh
+bash scripts/cat_demo/web.sh
 ```
