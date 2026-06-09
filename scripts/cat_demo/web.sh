@@ -30,7 +30,7 @@ echo ">>> URL on cloud : http://${SEMANTIC_CAT_WEB_HOST}:${SEMANTIC_CAT_WEB_PORT
 echo ">>> SSH tunnel   : ssh -N -L 17861:127.0.0.1:${SEMANTIC_CAT_WEB_PORT} -p 20755 jinsong.yuan@120.133.130.214"
 echo ">>> Laptop URL   : http://127.0.0.1:17861"
 echo ">>> CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}  (sim/EGL=cuda:0, nav=cuda:${VLFM_POINTNAV_GPU_ID})"
-echo ">>> Run modes    : semantic_query, find_cat, global_home_40, global_home_100, object_memory_cat, persistent_memory_cat_pair, persistent_memory_cat_pair_pointnav"
+echo ">>> Run modes    : semantic_query, find_cat, global_home_40, global_home_100, object_memory_cat, persistent_memory_cat_pair, multi_goal_cat"
 
 PIDS_ON_PORT="$(ss -ltnp 2>/dev/null | awk -v port=":${SEMANTIC_CAT_WEB_PORT}" '
   $4 ~ port"$" {

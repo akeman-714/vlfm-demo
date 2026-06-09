@@ -5,9 +5,10 @@
 
 | 模块 | 文档 | 改动量 | 状态 |
 |---|---|---|---|
-| 1 持久化障碍图 | [module-1-persistent-obstacle-map.md](module-1-persistent-obstacle-map.md) | 小 | ☐ 未开始 |
-| 2 记忆 json（物体点） | [module-2-object-memory.md](module-2-object-memory.md) | 小 | ☐ 未开始 |
-| 3 全局导航（A\*+控制器） | [module-3-global-navigation.md](module-3-global-navigation.md) | 中 | ◑ 代码+单测/闭环仿真已过，待 GPU 整跑验收 1–4 |
+| 1 持久化障碍图 | [module-1-persistent-obstacle-map.md](module-1-persistent-obstacle-map.md) | 小 | ✅ 已落地（f673463） |
+| 2 记忆 json（物体点） | [module-2-object-memory.md](module-2-object-memory.md) | 小 | ✅ 已落地（f673463） |
+| 3 全局导航（A\*+控制器） | [module-3-global-navigation.md](module-3-global-navigation.md) | 中 | ✅ 代码+单测已过；两阶段 web demo 跑通 |
+| 4 多目标顺序导航 | [module-4-multi-goal-sequential-nav.md](module-4-multi-goal-sequential-nav.md) | 中 | ◑ 开发中（Part A 简化 + Part B 排程） |
 
 > 交付顺序建议见文末「开发顺序」。每份文档是自包含的：目标、落点、勾选清单、坑与解法、验收标准。
 

@@ -92,18 +92,23 @@ RUN_MODES: dict[str, dict[str, Any]] = {
         },
         "paired_persistent": True,
     },
-    "persistent_memory_cat_pair_pointnav": {
-        "name": "Persistent Map + Memory Cat Pair (PointNav follower)",
-        "label": "map+memory-cat-pn",
+    "multi_goal_cat": {
+        "name": "Multi-goal: origin -> fridge -> cat -> origin",
+        "label": "multigoal",
         "split": "cat_demo",
-        "stage": "persistent-memory-pair-pointnav",
+        "stage": "multi-goal",
         "env": {
             "VLFM_GLOBAL_NAV": "1",
             "VLFM_NAV_DEBUG_LOG": "1",
             "VLFM_MEMORY_NAV_CONSERVATIVE": "0",
-            "VLFM_GLOBAL_NAV_FOLLOWER": "pointnav",
         },
         "paired_persistent": True,
+        # Pass 1 = single-goal find-cat (builds obstacle map + cat memory).
+        # Pass 2 = ordered multi-goal plan. Object tokens must match the detector
+        # vocabulary (English MP3D/COCO names), so use "refrigerator" not "冰箱";
+        # change the sequence freely (origin = episodic start).
+        "pass2_env": {"VLFM_GOAL_SEQUENCE": "origin, refrigerator, cat, origin"},
+        "pass2_reason": "Pass 2/2: multi-goal (origin -> refrigerator[explore] -> cat[memory A*] -> origin)",
     },
 }
 
@@ -407,12 +412,17 @@ def _run_eval(run_id: str, text: str, run_mode: str, api_key: str = "") -> None:
             if not memory_path.exists():
                 raise RuntimeError(f"Pass 1 finished but object memory was not written: {memory_path}")
 
-            _set_run(run_id, reason="Pass 2/2: load obstacle map + cat memory, then A* to memory")
+            pass2_env = dict(paired_env)
+            pass2_env.update(mode_config.get("pass2_env", {}))
+            _set_run(
+                run_id,
+                reason=str(mode_config.get("pass2_reason", "Pass 2/2: load obstacle map + cat memory, then A* to memory")),
+            )
             exit_code, _, _ = _run_eval_process(
                 run_id,
                 split,
                 "pass-2-load-and-a-star",
-                paired_env,
+                pass2_env,
                 run_dir / "pass2_recall",
             )
         else:

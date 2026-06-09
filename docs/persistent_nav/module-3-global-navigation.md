@@ -49,6 +49,8 @@ VLFM_GLOBAL_NAV=1 VLFM_NAV_DEBUG_GOAL=0,0 VLFM_NAV_DEBUG_AFTER=40 \
   xy↔px **只走** `obstacle_map._xy_to_px` / `_px_to_xy`（`base_map.py:35-60`），写一个薄 adapter，**禁止重写翻转**。
 - `route_through_array` 返回 `(indices_list, cost)`；`indices_list` 是 `[(r,c), ...]`，注意是 (row,col)。
 
+> ⚠️ **已被模块 4 Part A 取代**：geometric 跟随器与 `waypoint_controller.py` 已删除，全局导航统一走 A\* + PointNav follower（pointnav 自带局部避障，不再需要卡死/碰撞补丁）。下文为历史设计存档。
+
 ## 子模块 (b)：走路 — 新建 `vlfm/policy/utils/waypoint_controller.py`（选项 B，推荐）
 
 ```python

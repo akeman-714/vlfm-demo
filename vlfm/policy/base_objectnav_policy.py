@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
 import cv2
 import numpy as np
@@ -14,8 +14,8 @@ from vlfm.mapping.object_point_cloud_map import ObjectPointCloudMap
 from vlfm.mapping.obstacle_map import ObstacleMap
 from vlfm.obs_transformers.utils import image_resize
 from vlfm.policy.utils.pointnav_policy import WrappedPointNavResNetPolicy
-from vlfm.policy.utils.waypoint_controller import step_towards
 from vlfm.utils.geometry_utils import get_fov, rho_theta
+from vlfm.utils.goal_plan import Goal, GoalQueue, decompose
 from vlfm.utils.object_memory import recall_object, remember_object
 from vlfm.utils.path_planning import downsample_path, plan_path, rc_to_xy, snap_to_navigable, xy_to_rc
 from vlfm.vlm.blip2 import BLIP2Client
@@ -35,13 +35,11 @@ except Exception:
 
 
 # --- Module 3: global A* navigation (opt-in via VLFM_GLOBAL_NAV=1) ---
-# Turn step the simulator applies per discrete TURN action. cat_demo configures
-# turn_angle=30 (config/experiments/vlfm_objectnav_hm3d.yaml:29); override via env
-# if the action space changes. Used only as the controller's "is the waypoint
-# roughly ahead" threshold, so it need not be exact -- just near the real step.
-_NAV_TURN_ANGLE_RAD = float(np.deg2rad(float(os.environ.get("VLFM_NAV_TURN_ANGLE_DEG", "30"))))
-# Waypoint-reached tolerance (meters). Kept above the 0.25m forward step so the
-# controller can land inside it instead of oscillating around it.
+# A* plans discrete waypoints on the obstacle map; the trained PointNav policy
+# drives between consecutive waypoints with learned local obstacle avoidance
+# (see _navigate_global). No geometric controller / stuck-recovery is needed.
+# Waypoint-reached tolerance (meters). Kept above the 0.25m forward step so we
+# advance to the next waypoint instead of oscillating around it.
 _NAV_ARRIVE_RADIUS = 0.4
 # Spacing (pixels @ 20px/m -> 0.6m) used to thin the dense A* path into waypoints.
 _NAV_WAYPOINT_SPACING_PX = 12
@@ -50,11 +48,6 @@ _NAV_WAYPOINT_SPACING_PX = 12
 _NAV_GOAL_DRIFT_M = 0.5
 # Periodic safety replan (in steps) to absorb newly observed obstacles/free space.
 _NAV_REPLAN_PERIOD = 25
-_NAV_STUCK_MOVE_EPS_M = 0.03
-_NAV_STUCK_STEPS = 4
-_NAV_COLLISION_MARK_RADIUS_M = 0.125
-_NAV_COLLISION_MARK_AHEAD_M = 0.35
-_NAV_STUCK_STOP_MARGIN_M = 0.15
 
 
 class BaseObjectNavPolicy(BasePolicy):
@@ -107,8 +100,11 @@ class BaseObjectNavPolicy(BasePolicy):
         self._last_goal = np.zeros(2)
         self._remembered_goal: Union[np.ndarray, None] = None
         self._memory_recall_attempted = False
-        self._memory_written_this_episode = False
+        self._memory_written: Set[str] = set()
         self._last_persist_save_step = -1
+        # Module 4: ordered multi-goal plan (opt-in via VLFM_GOAL_SEQUENCE).
+        self._goal_queue: Union[GoalQueue, None] = None
+        self._multi_goal = False
         self._done_initializing = False
         self._called_stop = False
         # Module 3: global-navigation state (lazily planned by _navigate_global).
@@ -116,9 +112,6 @@ class BaseObjectNavPolicy(BasePolicy):
         self._path_goal: Union[np.ndarray, None] = None
         self._waypoint_idx = 0
         self._last_plan_step = 0
-        self._last_nav_robot_xy: Union[np.ndarray, None] = None
-        self._last_nav_action_id: Union[int, None] = None
-        self._nav_stuck_steps = 0
         self._compute_frontiers = compute_frontiers
         if compute_frontiers:
             self._obstacle_map = ObstacleMap(
@@ -136,8 +129,10 @@ class BaseObjectNavPolicy(BasePolicy):
         self._last_goal = np.zeros(2)
         self._remembered_goal = None
         self._memory_recall_attempted = False
-        self._memory_written_this_episode = False
+        self._memory_written = set()
         self._last_persist_save_step = -1
+        self._goal_queue = None
+        self._multi_goal = False
         self._num_steps = 0
         self._done_initializing = False
         self._called_stop = False
@@ -145,9 +140,6 @@ class BaseObjectNavPolicy(BasePolicy):
         self._path_goal = None
         self._waypoint_idx = 0
         self._last_plan_step = 0
-        self._last_nav_robot_xy = None
-        self._last_nav_action_id = None
-        self._nav_stuck_steps = 0
         if self._compute_frontiers:
             self._obstacle_map.reset()
             self._load_persistent_obstacles()
@@ -183,6 +175,8 @@ class BaseObjectNavPolicy(BasePolicy):
         if not self._done_initializing:  # Initialize
             mode = "initialize"
             pointnav_action = self._initialize()
+        elif self._multi_goal:  # Module 4: ordered multi-goal plan
+            mode, pointnav_action = self._act_multi_goal(observations, robot_xy)
         elif debug_goal is not None:  # Verification hook: drive to a fixed goal via A*
             mode = "navigate-debug"
             debug_conservative = os.environ.get("VLFM_NAV_DEBUG_CONSERVATIVE", "1") == "1"
@@ -208,7 +202,8 @@ class BaseObjectNavPolicy(BasePolicy):
             action_numpy = action_numpy[0]
         print(f"Step: {self._num_steps} | Mode: {mode} | Action: {action_numpy}")
         self._policy_info.update(self._get_policy_info(detections[0]))
-        self._maybe_remember_object(goal)
+        if not self._multi_goal:
+            self._maybe_remember_object(goal)
         self._maybe_save_persistent_obstacles()
         self._num_steps += 1
 
@@ -221,8 +216,15 @@ class BaseObjectNavPolicy(BasePolicy):
         assert masks.shape[1] == 1, "Currently only supporting one env at a time"
         if not self._did_reset and masks[0] == 0:
             self._reset()
-            self._target_object = observations["objectgoal"]
-            self._maybe_recall_object_memory()
+            seq = os.environ.get("VLFM_GOAL_SEQUENCE")
+            if seq and seq.strip():
+                self._goal_queue = GoalQueue(decompose(seq))
+                self._multi_goal = len(self._goal_queue) > 0
+            if self._multi_goal:
+                self._apply_current_goal()
+            else:
+                self._target_object = observations["objectgoal"]
+                self._maybe_recall_object_memory()
         try:
             self._cache_observations(observations)
         except IndexError as e:
@@ -263,16 +265,102 @@ class BaseObjectNavPolicy(BasePolicy):
         path = os.environ.get("VLFM_OBJECT_MEMORY_PATH")
         if (
             not path
-            or self._memory_written_this_episode
             or not self._called_stop
             or goal is None
             or not self._target_object
+            or self._target_object in self._memory_written
         ):
             return
 
         remember_object(path, self._target_object, goal[:2], start_pose=self._get_memory_start_pose())
-        self._memory_written_this_episode = True
+        self._memory_written.add(self._target_object)
         print(f"[memory] remembered {self._target_object} at {goal[:2].tolist()} in {path}")
+
+    def _act_multi_goal(self, observations: "TensorDict", robot_xy: np.ndarray) -> Tuple[str, Tensor]:
+        """Module 4: drive toward the current goal in the ordered plan. When a goal
+        is reached (``_called_stop``), record it (objects only) and advance to the
+        next goal, re-dispatching within the same step so we emit a moving action
+        instead of terminating -- the episode STOPs only after the last goal."""
+        for _ in range(len(self._goal_queue) + 1):
+            g = self._goal_queue.current()
+            mode, action = self._dispatch_current_goal(observations, robot_xy, g)
+            if not self._called_stop:
+                return mode, action
+            # Reached the current goal.
+            self._on_subgoal_reached(g, robot_xy)
+            if not self._goal_queue.advance():
+                print("[goal] all goals complete -> STOP", flush=True)
+                return mode, action  # _called_stop stays True -> episode terminates
+            self._called_stop = False  # reaching a sub-goal is not an episode stop
+            self._reset_per_goal_nav()
+            self._apply_current_goal()
+            print(f"[goal] advance -> #{self._goal_queue.index} {self._goal_queue.current()}", flush=True)
+        # Bounded loop exhausted (should not happen) -> stop defensively.
+        self._called_stop = True
+        return "goal-exhausted", self._stop_action
+
+    def _dispatch_current_goal(
+        self, observations: "TensorDict", robot_xy: np.ndarray, g: Goal
+    ) -> Tuple[str, Tensor]:
+        """One goal -> one action, mirroring the single-goal branch order: point ->
+        conservative A*; detected object -> go to it; known (remembered) object ->
+        A* to memory; unknown object -> explore."""
+        idx = self._goal_queue.index
+        if g.kind == "point":
+            return f"goal{idx}-point", self._navigate_to(g.xy, observations, conservative=True)
+        detected = self._get_target_object_location(robot_xy)
+        if detected is not None:
+            return f"goal{idx}-navigate", self._navigate_to(detected[:2], observations, conservative=False)
+        if self._remembered_goal is not None:
+            mem_conservative = os.environ.get("VLFM_MEMORY_NAV_CONSERVATIVE", "1") == "1"
+            return f"goal{idx}-memory", self._navigate_to(
+                self._remembered_goal, observations, conservative=mem_conservative, fallback_to_pointnav=True
+            )
+        return f"goal{idx}-explore", self._explore(observations)
+
+    def _on_subgoal_reached(self, g: Goal, robot_xy: np.ndarray) -> None:
+        """Persist a freshly reached object's location to memory (once per object)."""
+        if g.kind != "object":
+            return
+        path = os.environ.get("VLFM_OBJECT_MEMORY_PATH")
+        if not path or g.name in self._memory_written:
+            return
+        loc = self._get_target_object_location(robot_xy)
+        if loc is None:
+            return
+        remember_object(path, g.name, loc[:2], start_pose=self._get_memory_start_pose())
+        self._memory_written.add(g.name)
+        print(f"[memory] remembered {g.name} at {loc[:2].tolist()} in {path}", flush=True)
+
+    def _apply_current_goal(self) -> None:
+        """Point the perception/navigation stack at the current goal: set
+        ``_target_object`` (empty for point goals) and recall its memory."""
+        if self._goal_queue is None:
+            return
+        g = self._goal_queue.current()
+        if g is None:
+            return
+        if g.kind == "object":
+            self._target_object = g.name
+            path = os.environ.get("VLFM_OBJECT_MEMORY_PATH")
+            self._remembered_goal = recall_object(path, g.name) if path else None
+            tag = "known" if self._remembered_goal is not None else "unknown"
+            print(f"[goal] #{self._goal_queue.index} object '{g.name}' ({tag})", flush=True)
+        else:
+            self._target_object = ""
+            self._remembered_goal = None
+            print(f"[goal] #{self._goal_queue.index} point {np.round(g.xy, 2).tolist()}", flush=True)
+
+    def _reset_per_goal_nav(self) -> None:
+        """Clear per-goal navigation state when switching goals (keeps the shared
+        object map and obstacle map intact)."""
+        self._global_path = None
+        self._path_goal = None
+        self._waypoint_idx = 0
+        self._last_plan_step = self._num_steps
+        self._last_goal = np.zeros(2)
+        self._called_stop = False
+        self._pointnav_policy.reset()
 
     def _load_persistent_obstacles(self) -> None:
         path = os.environ.get("VLFM_PERSIST_MAP_PATH")
@@ -447,8 +535,9 @@ class BaseObjectNavPolicy(BasePolicy):
         return self._explore(observations)
 
     def _navigate_global(self, goal_xy: np.ndarray, conservative: bool = False) -> Union[Tensor, None]:
-        """Plan (and cache) an A* path to ``goal_xy`` on the obstacle map and emit
-        the next discrete action via the geometric waypoint controller.
+        """Plan (and cache) an A* path to ``goal_xy`` on the obstacle map and drive
+        toward the next waypoint with the trained PointNav policy (which provides
+        learned local obstacle avoidance between waypoints).
 
         Args:
             goal_xy: Episodic ``(x, y)`` goal in meters.
@@ -464,44 +553,18 @@ class BaseObjectNavPolicy(BasePolicy):
         """
         robot_xy = self._observations_cache["robot_xy"]
         heading = self._observations_cache["robot_heading"]
-        # VLFM_GLOBAL_NAV_FOLLOWER selects how A* waypoints are driven:
-        # "geometric" (default) uses the turn-then-forward controller; "pointnav"
-        # hands each waypoint to the trained PointNav policy for learned local
-        # obstacle avoidance.
-        use_pointnav_follower = os.environ.get("VLFM_GLOBAL_NAV_FOLLOWER", "geometric") == "pointnav"
-        if use_pointnav_follower:
-            # PointNav avoids obstacles from live depth, so we skip the geometric
-            # stuck detector and its obstacle-marking (which would otherwise write
-            # spurious obstacles into the persistent map). Let _pointnav own
-            # _last_goal so its RNN resets only when the waypoint advances.
-            force_replan = False
-        else:
-            self._last_goal = goal_xy  # surfaces the goal marker in the value-map viz
-            force_replan = self._update_nav_stuck_state(robot_xy, heading)
 
         # Stop once we are close enough to the actual goal.
         rho_goal, _ = rho_theta(robot_xy, heading, goal_xy)
         if rho_goal < self._pointnav_stop_radius:
             self._called_stop = True
-            return self._remember_nav_action(self._stop_action, robot_xy)
-        if (
-            not conservative
-            and force_replan
-            and rho_goal < self._pointnav_stop_radius + _NAV_STUCK_STOP_MARGIN_M
-        ):
-            self._called_stop = True
-            print(
-                "[nav-stuck] "
-                f"stopping near target after repeated blocked forward actions; rho_goal={rho_goal:.3f}",
-                flush=True,
-            )
-            return self._remember_nav_action(self._stop_action, robot_xy)
+            return self._stop_action
 
         navigable = self._obstacle_map._navigable_map.astype(bool)
         if conservative:
             navigable = navigable & self._obstacle_map.explored_area.astype(bool)
 
-        if force_replan or self._needs_replan(goal_xy, navigable):
+        if self._needs_replan(goal_xy, navigable):
             path_xy = self._plan_path_xy(robot_xy, goal_xy, navigable)
             if path_xy is None:
                 self._global_path = None
@@ -527,90 +590,21 @@ class BaseObjectNavPolicy(BasePolicy):
         next_wp = self._global_path[self._waypoint_idx]
         if os.environ.get("VLFM_NAV_DEBUG_LOG") == "1":
             rho_wp, theta_wp = rho_theta(robot_xy, heading, next_wp)
-            follower = "pointnav" if use_pointnav_follower else "geometric"
             print(
                 "[nav] "
-                f"follower={follower} "
                 f"xy={np.round(robot_xy, 3).tolist()} "
                 f"goal={np.round(goal_xy, 3).tolist()} "
                 f"wp_idx={self._waypoint_idx}/{len(self._global_path)} "
                 f"wp={np.round(next_wp, 3).tolist()} "
-                f"rho_wp={rho_wp:.3f} theta_wp={theta_wp:.3f} "
-                f"rho_goal={rho_goal:.3f} stuck={self._nav_stuck_steps}",
+                f"rho_wp={rho_wp:.3f} theta_wp={theta_wp:.3f} rho_goal={rho_goal:.3f}",
                 flush=True,
             )
-        if use_pointnav_follower:
-            # A* sets the intermediate waypoint; the trained PointNav policy drives
-            # to it with learned local obstacle avoidance. stop=False so it never
-            # emits STOP at an intermediate waypoint -- the final STOP is the
-            # rho_goal check above. _pointnav owns _last_goal, so its RNN resets
-            # only when the waypoint actually advances (not every step).
-            return self._pointnav(next_wp, stop=False)
-
-        action = step_towards(
-            next_wp,
-            robot_xy,
-            heading,
-            _NAV_TURN_ANGLE_RAD,
-            _NAV_ARRIVE_RADIUS,
-        )
-        if action is None:  # defensive: already-reached waypoints were skipped above
-            self._called_stop = True
-            return self._remember_nav_action(self._stop_action, robot_xy)
-        return self._remember_nav_action(action, robot_xy)
-
-    def _remember_nav_action(self, action: Tensor, robot_xy: np.ndarray) -> Tensor:
-        self._last_nav_robot_xy = np.asarray(robot_xy, dtype=np.float64).copy()
-        try:
-            self._last_nav_action_id = int(action.detach().cpu().numpy()[0][0])
-        except Exception:
-            self._last_nav_action_id = None
-        return action
-
-    def _update_nav_stuck_state(self, robot_xy: np.ndarray, heading: float) -> bool:
-        if self._last_nav_action_id != 1 or self._last_nav_robot_xy is None:
-            self._nav_stuck_steps = 0
-            return False
-
-        moved = float(np.linalg.norm(np.asarray(robot_xy, dtype=np.float64) - self._last_nav_robot_xy))
-        if moved >= _NAV_STUCK_MOVE_EPS_M:
-            self._nav_stuck_steps = 0
-            return False
-
-        self._nav_stuck_steps += 1
-        if self._nav_stuck_steps < _NAV_STUCK_STEPS:
-            return False
-
-        self._mark_collision_ahead(robot_xy, heading)
-        self._mark_current_waypoint_blocked()
-        self._global_path = None
-        self._nav_stuck_steps = 0
-        print(
-            "[nav-stuck] "
-            f"forward moved only {moved:.3f}m near xy={np.round(robot_xy, 3).tolist()}; "
-            "marked a local obstacle ahead and will replan",
-            flush=True,
-        )
-        return True
-
-    def _mark_collision_ahead(self, robot_xy: np.ndarray, heading: float) -> None:
-        forward = np.array([np.cos(heading), np.sin(heading)], dtype=np.float64)
-        blocked_xy = np.asarray(robot_xy, dtype=np.float64) + forward * _NAV_COLLISION_MARK_AHEAD_M
-        self._mark_obstacle_disk(blocked_xy, _NAV_COLLISION_MARK_RADIUS_M)
-
-    def _mark_current_waypoint_blocked(self) -> None:
-        if self._global_path is None or self._waypoint_idx >= len(self._global_path):
-            return
-        self._mark_obstacle_disk(self._global_path[self._waypoint_idx], _NAV_COLLISION_MARK_RADIUS_M)
-
-    def _mark_obstacle_disk(self, center_xy: np.ndarray, radius_m: float) -> None:
-        blocked_rc = xy_to_rc(self._obstacle_map, np.asarray(center_xy, dtype=np.float64))
-        radius_px = max(1, int(round(radius_m * self._obstacle_map.pixels_per_meter)))
-        rr, cc = np.ogrid[: self._obstacle_map._map.shape[0], : self._obstacle_map._map.shape[1]]
-        mask = (rr - blocked_rc[0]) ** 2 + (cc - blocked_rc[1]) ** 2 <= radius_px**2
-        self._obstacle_map._map[mask] = 1
-        self._obstacle_map._recompute_navigable()
-        self._obstacle_map.explored_area[self._obstacle_map._navigable_map == 0] = 0
+        # A* sets the intermediate waypoint; the trained PointNav policy drives to
+        # it with learned local obstacle avoidance. stop=False so it never emits
+        # STOP at an intermediate waypoint -- the final STOP is the rho_goal check
+        # above. _pointnav owns _last_goal, so its RNN resets only when the
+        # waypoint actually advances (not every step).
+        return self._pointnav(next_wp, stop=False)
 
     def _needs_replan(self, goal_xy: np.ndarray, navigable: np.ndarray) -> bool:
         """Decide whether to recompute the global path this step (vs. keep following

@@ -36,7 +36,6 @@ There is no separate script per experiment — the front-end spawns the same
 | Global home 40 / 100 | `VLFM_GLOBAL_NAV=1` + A* back to (0,0) after 40 / 100 steps | 3 |
 | Object memory cat | `VLFM_GLOBAL_NAV=1` + `VLFM_OBJECT_MEMORY_PATH=…/cat.json` | 2 + 3 |
 | Persistent map + memory (2 passes) | runs twice: pass1 saves `cat_map.npz` + `cat.json`, pass2 loads them + A* | 1 + 2 + 3 |
-| …PointNav follower (2 passes) | same as above + `VLFM_GLOBAL_NAV_FOLLOWER=pointnav` | 1 + 2 + 3 |
 
 Module env-var switches are documented in `docs/persistent_nav/`.
 
