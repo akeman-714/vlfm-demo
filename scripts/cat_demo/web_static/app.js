@@ -49,9 +49,14 @@ function setBusy(isBusy) {
   apiKeyInput.disabled = isBusy;
 }
 
-function setFrame(img, empty, url) {
+function setFrame(img, empty, url, token) {
   if (!url) return;
-  img.src = `${url}?t=${Date.now()}`;
+  const tok = token || "";
+  // Only refetch when the frame actually changed. Polling (0.8s) is faster than
+  // generation (~1.5s), so without this guard the same frame is re-downloaded ~2x.
+  if (img.dataset.frameToken === tok && img.getAttribute("src")) return;
+  img.dataset.frameToken = tok;
+  img.src = `${url}?v=${encodeURIComponent(tok || Date.now())}`;
   img.classList.add("visible");
   empty.classList.add("hidden");
 }
@@ -76,8 +81,8 @@ function renderRun(run) {
   logText.textContent = run.log_tail || "";
   logText.scrollTop = logText.scrollHeight;
 
-  if (run.latest_frame_url) setFrame(liveFrame, frameEmpty, run.latest_frame_url);
-  if (run.latest_bev_frame_url) setFrame(liveBevFrame, bevFrameEmpty, run.latest_bev_frame_url);
+  if (run.latest_frame_url) setFrame(liveFrame, frameEmpty, run.latest_frame_url, run.latest_frame_token);
+  if (run.latest_bev_frame_url) setFrame(liveBevFrame, bevFrameEmpty, run.latest_bev_frame_url, run.latest_bev_frame_token);
   if (run.live_video_url) {
     setVideo(run.live_video_url, run.live_video_path || "live rgb saved");
   } else if (run.video_url) {
@@ -114,8 +119,10 @@ form.addEventListener("submit", async (event) => {
   resultVideo.removeAttribute("src");
   liveFrame.removeAttribute("src");
   liveFrame.classList.remove("visible");
+  delete liveFrame.dataset.frameToken;
   liveBevFrame.removeAttribute("src");
   liveBevFrame.classList.remove("visible");
+  delete liveBevFrame.dataset.frameToken;
   frameEmpty.classList.remove("hidden");
   bevFrameEmpty.classList.remove("hidden");
   frameEmpty.textContent = "starting";

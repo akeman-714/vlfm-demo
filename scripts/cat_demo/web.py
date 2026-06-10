@@ -171,11 +171,28 @@ def _safe_run(run_id: str) -> RunState:
         return runs[run_id]
 
 
+def _frame_token(path_str: Optional[str]) -> Optional[str]:
+    """Stable per-frame id (mtime in ms) so the browser only refetches when a frame changes.
+
+    Without this the page cache-busts every poll and re-downloads the *same* frame ~2x
+    (poll 0.8s < generation ~1.5s). The mtime also differs across the two-pass modes, where
+    filenames restart at env0_step0000 in a new stage dir.
+    """
+    if not path_str:
+        return None
+    try:
+        return str(int(os.path.getmtime(path_str) * 1000))
+    except OSError:
+        return None
+
+
 def _serialize(run: RunState) -> dict[str, Any]:
     data = asdict(run)
     data["elapsed_sec"] = round((run.finished_at or time.time()) - run.started_at, 1)
     data["latest_frame_url"] = f"/api/runs/{run.run_id}/latest-frame" if run.latest_frame else None
     data["latest_bev_frame_url"] = f"/api/runs/{run.run_id}/latest-bev-frame" if run.latest_bev_frame else None
+    data["latest_frame_token"] = _frame_token(run.latest_frame)
+    data["latest_bev_frame_token"] = _frame_token(run.latest_bev_frame)
     data["video_url"] = f"/api/runs/{run.run_id}/video" if run.video_path else None
     data["live_video_url"] = f"/api/runs/{run.run_id}/live-video" if run.live_video_path else None
     data["log_tail"] = _tail(Path(run.log_path), 100) if run.log_path else ""
@@ -227,6 +244,43 @@ def _build_live_rgb_video(live_dir: Path, out_path: Path) -> Optional[Path]:
     except Exception:
         return None
     return out_path if out_path.exists() else None
+
+
+def _encode_preview(path: Path, max_dim: int, quality: int) -> Optional[bytes]:
+    """Downscale + JPEG-encode a dumped frame for the live preview.
+
+    Live frames are 640x480 RGB / variable-size BEV PNGs (~160KB / ~60KB). Shipping those
+    raw over the SSH tunnel is what makes the stream fall behind generation, so we shrink
+    them to a JPEG (~15-20KB) on the way out. The on-disk PNGs and the archived mp4 keep
+    full resolution. Returns None (caller falls back to the raw PNG) if cv2/encode fails or
+    the file is mid-write.
+    """
+    try:
+        import cv2
+
+        img = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        h, w = img.shape[:2]
+        scale = max_dim / float(max(h, w))
+        if scale < 1.0:
+            img = cv2.resize(img, (round(w * scale), round(h * scale)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        if not ok:
+            return None
+        return buf.tobytes()
+    except Exception:
+        return None
+
+
+def _serve_preview_frame(path_str: Optional[str], max_dim: int, quality: int) -> Response:
+    frame = Path(path_str or "")
+    if not frame.exists():
+        return Response(status=204)
+    data = _encode_preview(frame, max_dim=max_dim, quality=quality)
+    if data is None:
+        return send_file(frame, mimetype="image/png", max_age=0)
+    return Response(data, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 def _resolve_semantic_goal(text: str, api_key_override: str = "") -> GoalResolution:
@@ -507,19 +561,13 @@ def get_run(run_id: str) -> Response:
 @app.get("/api/runs/<run_id>/latest-frame")
 def latest_frame(run_id: str) -> Response:
     run = _safe_run(run_id)
-    frame = Path(run.latest_frame or "")
-    if not frame.exists():
-        return Response(status=204)
-    return send_file(frame, mimetype="image/png", max_age=0)
+    return _serve_preview_frame(run.latest_frame, max_dim=480, quality=72)
 
 
 @app.get("/api/runs/<run_id>/latest-bev-frame")
 def latest_bev_frame(run_id: str) -> Response:
     run = _safe_run(run_id)
-    frame = Path(run.latest_bev_frame or "")
-    if not frame.exists():
-        return Response(status=204)
-    return send_file(frame, mimetype="image/png", max_age=0)
+    return _serve_preview_frame(run.latest_bev_frame, max_dim=480, quality=80)
 
 
 @app.get("/api/runs/<run_id>/video")
