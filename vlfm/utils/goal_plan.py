@@ -36,6 +36,12 @@ _SPLIT_RE = re.compile(r"[\s,，、。;；>＞→]+")
 # controlled CJK form is expected to be already token-separated by commas.
 _FILLER = {"to", "then", "go", "the", "and"}
 
+# Keep user-facing shorthand aligned with detector vocabulary.
+_ALIASES = {
+    "plant": "potted plant",
+    "fridge": "refrigerator",
+}
+
 
 @dataclass
 class Goal:
@@ -80,7 +86,7 @@ def decompose(text: Optional[str]) -> List[Goal]:
         if low in ORIGIN_WORDS:
             goals.append(_origin_goal())
         else:
-            goals.append(Goal(kind="object", name=tok))
+            goals.append(Goal(kind="object", name=_ALIASES.get(low, tok)))
     return goals
 
 

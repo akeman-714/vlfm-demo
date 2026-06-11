@@ -52,6 +52,29 @@ echo ">>> tb_dir   =${TB_DIR}"
 echo ">>> log      =${LOG}"
 echo
 
+echo "-- episode pose --"
+python - <<'PY' || true
+import gzip
+import json
+import math
+from pathlib import Path
+
+episode = Path("data/datasets/objectnav/hm3d/v1/cat_demo/content/TEEsavR23oF.json.gz")
+with gzip.open(episode, "rt") as f:
+    data = json.load(f)
+ep = data["episodes"][0]
+rot = ep["start_rotation"]
+yaw = math.degrees(2.0 * math.atan2(rot[1], rot[3]))
+goals = next(iter(data["goals_by_category"].values()))
+goal = goals[0]
+print(f"  start_position={ep['start_position']}")
+print(f"  start_yaw={yaw:+.2f} deg")
+print(f"  target={goal['object_name']} position={goal['position']}")
+print(f"  view_points={len(goal.get('view_points', []))}")
+print(f"  info={ep.get('info', {})}")
+PY
+echo
+
 echo "-- pre-flight GPU usage --"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | head -1
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tail -n +2 | awk -F',' -v visible="${CUDA_VISIBLE_DEVICES}" '
@@ -75,11 +98,20 @@ for port in 12181 12182 12183 12184; do
 done
 echo
 
+# Cat-on-furniture adjustments:
+# - pointnav_stop_radius=1.3: the cat sits on a bed; the nearest navigable
+#   point is ~1.0 m from the cat center, so the default 0.9 can never trigger
+#   STOP and the episode runs out the step budget.
+# - success_distance=0.5: goal view_points are navigable floor cells beside
+#   the bed; the object-map projection of a cat on furniture is noisy, so the
+#   default 0.1 m is not reachable in practice.
 python -um vlfm.run \
   habitat_baselines.evaluate=True \
   habitat_baselines.eval_ckpt_path_dir=data/dummy_policy.pth \
   habitat_baselines.load_resume_state_config=False \
   habitat_baselines.rl.policy.name=HabitatITMPolicyV2 \
+  habitat_baselines.rl.policy.pointnav_stop_radius=1.2 \
+  habitat.task.measurements.success.success_distance=0.5 \
   habitat.task.lab_sensors.base_explorer.turn_angle=30 \
   habitat_baselines.num_environments=1 \
   habitat_baselines.eval.split="${SPLIT}" \

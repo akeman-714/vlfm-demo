@@ -196,8 +196,18 @@ class ObstacleMap(BaseMap):
                 elif abs(dist) < min_dist:
                     min_dist = abs(dist)
                     best_idx = idx
+            # Keep the agent's current component plus any other component large
+            # enough to be a real explored region (>= area_thresh). This prevents a
+            # momentary false obstacle (e.g. depth glitches when clipping through
+            # geometry) from splitting the map and erasing previously-explored rooms.
+            # This assumes a single-floor scene, which is what this pipeline targets.
+            keep_idxs = {best_idx}
+            for idx, cnt in enumerate(contours):
+                if cv2.contourArea(cnt) >= self._area_thresh_in_pixels:
+                    keep_idxs.add(idx)
             new_area = np.zeros_like(self.explored_area, dtype=np.uint8)
-            cv2.drawContours(new_area, contours, best_idx, 1, -1)  # type: ignore
+            for idx in keep_idxs:
+                cv2.drawContours(new_area, contours, idx, 1, -1)  # type: ignore
             self.explored_area = new_area.astype(bool)
 
         # Compute frontier locations

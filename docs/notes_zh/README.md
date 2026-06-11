@@ -17,6 +17,9 @@
 | [05_数据形态速查表.md](./05_数据形态速查表.md) | 每个张量 / 数组 / JSON 的形状、单位与典型数值 | 查表 |
 | [06_仿真环境_Habitat与接口.md](./06_仿真环境_Habitat与接口.md) | Habitat 仿真本体、配置/传感器/动作接口、RGBD 是怎么从 sim 流到策略再到 VLM RPC 的 | 代码细节 |
 | [07_VLFM_全景介绍.md](./07_VLFM_全景介绍.md) | 问题定义 / 视频生成 / Habitat→ROS 移植 / 与 SLAM 等导航对比 / 应用端展望 | **汇报评审** |
+| [08_Reality真机数据格式端到端变化链.md](./08_Reality真机数据格式端到端变化链.md) | 真机(Reality)RGBD / 位姿 / 动作端到端数据格式变化链 | 代码细节 |
+| [09_YOLO26_TensorRT替换方案.md](./09_YOLO26_TensorRT替换方案.md) | 用 YOLO26+TensorRT 替换 YOLOv7-e6e:思路 / 坑 / 验收 | 工程方案 |
+| [10_YOLO26n升级到l方案.md](./10_YOLO26n升级到l方案.md) | yolo26n → yolo26l 升级:改动面 / n→l 专属坑 / 验收闸门 | 工程方案 |
 
 如果你只读一篇：
 

@@ -20,13 +20,18 @@ def test_decompose_basic_zh() -> None:
 def test_decompose_arrows_and_spaces() -> None:
     goals = decompose("origin > fridge → cat , origin")
     assert [g.kind for g in goals] == ["point", "object", "object", "point"]
-    assert goals[1].name == "fridge" and goals[2].name == "cat"
+    assert goals[1].name == "refrigerator" and goals[2].name == "cat"
 
 
 def test_decompose_drops_english_filler() -> None:
     goals = decompose("go to fridge then cat")
-    assert [g.name for g in goals] == ["fridge", "cat"]
+    assert [g.name for g in goals] == ["refrigerator", "cat"]
     assert all(g.kind == "object" for g in goals)
+
+
+def test_decompose_aliases_detector_vocab() -> None:
+    goals = decompose("plant fridge cat")
+    assert [g.name for g in goals] == ["potted plant", "refrigerator", "cat"]
 
 
 def test_decompose_empty() -> None:
