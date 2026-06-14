@@ -5,6 +5,10 @@
 # 用法：bash scripts/launch_vlm_servers_jy.sh [GPU_ID]
 # 默认 GPU=0；改成别的卡号即可。
 # 回滚到老 YOLOv7：把 0.3 pane 的 yolo_prefix/yolo_trt 换回 ${prefix} + vlfm.vlm.yolov7。
+#
+# ITM 后端切换(默认 siglip2,协议完全兼容,下游 policy/value_map/reality 都不用改)：
+#   bash scripts/launch_vlm_servers_jy.sh 0                     # 默认:SigLIP2-base ITM(siglip2_itm)
+#   ITM_BACKEND=blip2 bash scripts/launch_vlm_servers_jy.sh 0   # 回滚:BLIP2-ITM(vlfm_pip)
 set -euo pipefail
 
 GPU_ID="${1:-0}"
@@ -13,7 +17,16 @@ CONDA_SH="${CONDA_SH:-/data/jinsong.yuan/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-vlfm_pip}"
 # YOLO26+TensorRT 检测器跑在自己的 env(ultralytics+tensorrt),不污染 vlfm_pip。
 YOLO_TRT_ENV="${YOLO_TRT_ENV:-yolo_trt}"
-YOLO_TRT_MODEL="${YOLO_TRT_MODEL:-data/yolo26n.engine}"
+YOLO_TRT_MODEL="${YOLO_TRT_MODEL:-data/yolo26l.engine}"
+
+# ITM(图文相似度,value map 用)后端可切换：默认 siglip2;blip2 仍可一键回滚。
+ITM_BACKEND="${ITM_BACKEND:-siglip2}"
+SIGLIP_CONDA_ENV="${SIGLIP_CONDA_ENV:-siglip2_itm}"
+DEFAULT_SIGLIP_MODEL_ID="/data/jinsong.yuan/siglip2-base-patch16-384"
+if [ ! -d "${DEFAULT_SIGLIP_MODEL_ID}" ]; then
+  DEFAULT_SIGLIP_MODEL_ID="google/siglip2-base-patch16-384"
+fi
+SIGLIP_MODEL_ID="${SIGLIP_MODEL_ID:-${DEFAULT_SIGLIP_MODEL_ID}}"
 
 export MOBILE_SAM_CHECKPOINT="${MOBILE_SAM_CHECKPOINT:-data/mobile_sam.pt}"
 export GROUNDING_DINO_CONFIG="${GROUNDING_DINO_CONFIG:-GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py}"
@@ -35,17 +48,38 @@ prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${CONDA_ENV} && e
 # YOLO pane 用 yolo_trt env；PYTHONPATH 让 `python -m vlfm.vlm.yolo_trt` 不必 pip 装 vlfm 也能找到包。
 yolo_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${YOLO_TRT_ENV} && export CUDA_VISIBLE_DEVICES=${GPU_ID} && export PYTHONPATH=${REPO_DIR}"
 
+# SigLIP2 pane 用独立 env + PYTHONPATH(不必把整个 vlfm pip 装进新 env),避免污染 vlfm_pip 的 transformers==4.26.0。
+siglip_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${SIGLIP_CONDA_ENV} && export CUDA_VISIBLE_DEVICES=${GPU_ID} && export PYTHONPATH=${REPO_DIR} && export HF_ENDPOINT='${HF_ENDPOINT}' && export SIGLIP_MODEL_ID='${SIGLIP_MODEL_ID}'"
+
+# 按 ITM_BACKEND 选 12182 pane 的命令。校验放在建 tmux session 之前,避免留下半启动的会话。
+case "${ITM_BACKEND}" in
+  blip2)
+    itm_cmd="${prefix} && python -m vlfm.vlm.blip2itm --port ${BLIP2ITM_PORT}"
+    ;;
+  siglip2)
+    itm_cmd="${siglip_prefix} && python -m vlfm.vlm.siglip2itm --port ${BLIP2ITM_PORT}"
+    ;;
+  *)
+    echo "Unknown ITM_BACKEND=${ITM_BACKEND}; expected blip2 or siglip2" >&2
+    exit 1
+    ;;
+esac
+
 tmux new-session -d -s "${session_name}"
 tmux split-window -v -t "${session_name}:0"
 tmux split-window -h -t "${session_name}:0.0"
 tmux split-window -h -t "${session_name}:0.2"
 
 tmux send-keys -t "${session_name}:0.0" "${prefix} && python -m vlfm.vlm.grounding_dino --port ${GROUNDING_DINO_PORT}" C-m
-tmux send-keys -t "${session_name}:0.1" "${prefix} && python -m vlfm.vlm.blip2itm     --port ${BLIP2ITM_PORT}"      C-m
+tmux send-keys -t "${session_name}:0.1" "${itm_cmd}" C-m
 tmux send-keys -t "${session_name}:0.2" "${prefix} && python -m vlfm.vlm.sam           --port ${SAM_PORT}"           C-m
 tmux send-keys -t "${session_name}:0.3" "${yolo_prefix} && python -m vlfm.vlm.yolo_trt --port ${YOLOV7_PORT} --model ${YOLO_TRT_MODEL}" C-m
 
 echo "Started tmux session: ${session_name}  (GPU ${GPU_ID})"
+echo "ITM backend: ${ITM_BACKEND}  (port ${BLIP2ITM_PORT}, route /blip2itm)"
+if [ "${ITM_BACKEND}" = "siglip2" ]; then
+  echo "  SigLIP2 env=${SIGLIP_CONDA_ENV}  model=${SIGLIP_MODEL_ID}"
+fi
 echo "Ports: GDINO=${GROUNDING_DINO_PORT}  BLIP2ITM=${BLIP2ITM_PORT}  SAM=${SAM_PORT}  YOLO26-TRT=${YOLOV7_PORT}"
 echo "Attach:  tmux attach -t ${session_name}"
 echo "Kill:    tmux kill-session -t ${session_name}"

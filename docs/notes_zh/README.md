@@ -20,6 +20,7 @@
 | [08_Reality真机数据格式端到端变化链.md](./08_Reality真机数据格式端到端变化链.md) | 真机(Reality)RGBD / 位姿 / 动作端到端数据格式变化链 | 代码细节 |
 | [09_YOLO26_TensorRT替换方案.md](./09_YOLO26_TensorRT替换方案.md) | 用 YOLO26+TensorRT 替换 YOLOv7-e6e:思路 / 坑 / 验收 | 工程方案 |
 | [10_YOLO26n升级到l方案.md](./10_YOLO26n升级到l方案.md) | yolo26n → yolo26l 升级:改动面 / n→l 专属坑 / 验收闸门 | 工程方案 |
+| [11_SigLIP2_ITM_可回滚替换方案.md](./11_SigLIP2_ITM_可回滚替换方案.md) | SigLIP2-ITM 可回滚替换 BLIP2-ITM:规划 / 坑 / 解决方案 / 验收 | 工程方案 |
 
 如果你只读一篇：
 

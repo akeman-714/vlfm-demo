@@ -21,7 +21,7 @@ class ServerMixin:
         raise NotImplementedError
 
 
-def host_model(model: Any, name: str, port: int = 5000) -> None:
+def host_model(model: Any, name: str, port: int = 5000, threaded: bool = True) -> None:
     """
     Hosts a model as a REST API using Flask.
     """
@@ -32,7 +32,7 @@ def host_model(model: Any, name: str, port: int = 5000) -> None:
         payload = request.json
         return jsonify(model.process_payload(payload))
 
-    app.run(host="localhost", port=port)
+    app.run(host="localhost", port=port, threaded=threaded)
 
 
 def bool_arr_to_str(arr: np.ndarray) -> str:
@@ -55,7 +55,7 @@ def str_to_bool_arr(s: str, shape: tuple) -> np.ndarray:
 
 
 def image_to_str(img_np: np.ndarray, quality: float = 90.0) -> str:
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
     retval, buffer = cv2.imencode(".jpg", img_np, encode_param)
     img_str = base64.b64encode(buffer).decode("utf-8")
     return img_str
