@@ -512,3 +512,92 @@ ITM_BACKEND=blip2 bash scripts/launch_vlm_servers_jy.sh 0
 3. 12192 smoke:显存、10 次请求、排序方向。
 4. Habitat 空卡拓扑下跑完整 cat_demo。
 5. 只有成功率和视频表现不差于 base,才考虑把 `SIGLIP_MODEL_ID` 默认改成 so400m。
+
+---
+
+## 11.11 2026-06-14 SigLIP2 TensorRT 固化记录
+
+### 产物
+
+- ONNX:
+  - `data/siglip2_vision_b16_384.onnx` 约 356 MiB,`pixel_values[1,3,384,384] -> image_embeds[1,768]`
+  - `data/siglip2_text_b16.onnx` 约 1.1 GiB,`input_ids[1,64] -> text_embeds[1,768]`
+- TensorRT FP16 engine:
+  - `data/siglip2_vision_b16_384_fp16.engine` 约 188 MiB
+  - `data/siglip2_text_b16_fp16.engine` 约 566 MiB
+- COCO-80 text table:
+  - `data/siglip2_text_coco80_fp16.npy` 约 124 KiB
+  - `data/siglip2_text_coco80_fp16_meta.json`
+
+### 本轮修复
+
+- `scripts/siglip2_trt/build_engine.py` 兼容 TensorRT 10 的 `IHostMemory`:用 `memoryview(serialized)` 写文件,用文件大小打印 engine 体积。
+- `scripts/siglip2_trt/export_onnx.py` 显式抽取 HF `BaseModelOutputWithPooling.pooler_output`,避免导出 token grid 等多余 output。重导后的 ONNX 均为单输出 `[1,768]`。
+- `vlfm/vlm/siglip2itm.py` 增加 `_TRTRunner`:
+  - TensorRT 10 name-based I/O
+  - `cuda-python` H2D/D2H
+  - input shape 校验、固定 shape 校验、`execute_async_v3` 失败检查
+  - 兼容旧多输出 engine:优先返回唯一 rank-2 pooled embedding
+- 新增 `scripts/siglip2_trt/smoke_test.py`,支持两阶段验收:
+  - `siglip2_itm` 生成 torch reference
+  - `siglip2_itm` 或 `yolo_trt` 加载 TRT engine 做数值对比
+
+### 环境记录
+
+- `siglip2_itm` 已安装 `tensorrt-cu12==10.9.0.34`:
+  - 本地 cache 复用 `tensorrt_cu12` / `tensorrt_cu12_libs`
+  - 仅下载 `tensorrt_cu12_bindings-10.9.0.34-cp310...whl`
+- `yolo_trt` 也可加载同版本 engine；本轮最终 smoke 用 `siglip2_itm` 和 GPU1。
+
+### 验收命令与结果
+
+生成 torch reference:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. \
+  /data/jinsong.yuan/miniconda3/envs/siglip2_itm/bin/python \
+  scripts/siglip2_trt/smoke_test.py \
+  --mode torch-ref \
+  --model-id /data/jinsong.yuan/siglip2-base-patch16-384 \
+  --ref outputs/siglip2_trt_smoke/ref.npz
+```
+
+结果:`torch cosine=0.051808`。
+
+TRT 数值对比:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. \
+  /data/jinsong.yuan/miniconda3/envs/siglip2_itm/bin/python \
+  scripts/siglip2_trt/smoke_test.py \
+  --mode trt-check \
+  --ref outputs/siglip2_trt_smoke/ref.npz
+```
+
+结果:
+
+- image embedding cosine vs torch:`0.999999`
+- text embedding cosine vs torch:`1.000000`
+- final cosine:`torch=0.051808`,`trt=0.051855`,`abs_diff=0.000047`
+- text table path:`table_score_abs_diff=0.000009`
+
+服务类 runtime 分支:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 PYTHONPATH=. \
+  SIGLIP_VISION_ENGINE=data/siglip2_vision_b16_384_fp16.engine \
+  SIGLIP_TEXT_ENGINE=data/siglip2_text_b16_fp16.engine \
+  SIGLIP_TEXT_CACHE=0 \
+  /data/jinsong.yuan/miniconda3/envs/siglip2_itm/bin/python - <<'PY'
+from scripts.siglip2_trt.smoke_test import _demo_image, DEFAULT_PROMPT
+from vlfm.vlm.siglip2itm import SigLIP2ITM
+itm = SigLIP2ITM(model_id="/data/jinsong.yuan/siglip2-base-patch16-384")
+print(itm.cosine(_demo_image(), DEFAULT_PROMPT))
+PY
+```
+
+结果:`0.051849`,与 TRT smoke 一致。
+
+### 剩余边界
+
+当前 `SigLIP2ITM` 服务类仍会加载 HF model / processor,即使启用了 TRT engine 或 text table；本轮已经验证了 tower engine binding 和数值等价,但“完全不加载 torch/HF 模型的 edge runtime”仍是下一步单独 refactor。
