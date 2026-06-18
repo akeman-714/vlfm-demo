@@ -1,5 +1,6 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
+import os
 from typing import Dict, List, Tuple, Union
 
 import cv2
@@ -22,11 +23,16 @@ class ObjectPointCloudMap:
         self._erosion_size = erosion_size
         self.last_target_coord: Union[np.ndarray, None] = None
         self._rejected: Dict[str, List[Tuple[np.ndarray, float]]] = {}
+        # Per-detection "strike" counter for update_explored: an out-of-range
+        # cluster must be seen inside the confirmation cone this many frames
+        # without being re-confirmed within range before it is deleted (anti-flicker).
+        self._strikes: Dict[float, int] = {}
 
     def reset(self) -> None:
         self.clouds = {}
         self.last_target_coord = None
         self._rejected = {}
+        self._strikes = {}
 
     def has_object(self, target_class: str) -> bool:
         return target_class in self.clouds and len(self.clouds[target_class]) > 0
@@ -146,12 +152,21 @@ class ObjectPointCloudMap:
                 self.clouds[obj],
             )
             range_ids = set(within_range[..., -1].tolist())
+            # Anti-flicker grace window: an out-of-range cluster that has entered
+            # the confirmation cone is given VLFM_EXPLORED_STRIKES frames (default
+            # 0 == original "delete on first sight in cone"). Each in-cone frame
+            # where it is still not promoted to within-range adds a strike; only
+            # when strikes exceed the threshold is the cluster deleted. A cluster
+            # re-detected within range (range_id == 1) is kept permanently.
+            strike_thresh = int(os.environ.get("VLFM_EXPLORED_STRIKES", "0"))
             for range_id in range_ids:
                 if range_id == 1:
                     # Detection was originally within range
                     continue
-                # Remove all points from self.clouds[obj] that have the same range_id
-                self.clouds[obj] = self.clouds[obj][self.clouds[obj][..., -1] != range_id]
+                self._strikes[range_id] = self._strikes.get(range_id, 0) + 1
+                if self._strikes[range_id] > strike_thresh:
+                    # Remove all points from self.clouds[obj] that have the same range_id
+                    self.clouds[obj] = self.clouds[obj][self.clouds[obj][..., -1] != range_id]
 
     def get_target_cloud(self, target_class: str) -> np.ndarray:
         target_cloud = self.clouds[target_class].copy()
@@ -180,7 +195,8 @@ class ObjectPointCloudMap:
         cloud = get_point_cloud(valid_depth, final_mask, fx, fy)
         cloud = get_random_subarray(cloud, 5000)
         if self.use_dbscan:
-            cloud = open3d_dbscan_filtering(cloud)
+            min_pts = int(os.environ.get("VLFM_DBSCAN_MIN_POINTS", "100"))
+            cloud = open3d_dbscan_filtering(cloud, min_points=min_pts)
 
         return cloud
 

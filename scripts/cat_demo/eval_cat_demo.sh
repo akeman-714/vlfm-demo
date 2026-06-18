@@ -123,6 +123,8 @@ python -um vlfm.run \
   habitat_baselines.rl.policy.name=HabitatITMPolicyV2 \
   habitat_baselines.rl.policy.pointnav_policy_path="${POINTNAV_POLICY_PATH}" \
   habitat_baselines.rl.policy.pointnav_stop_radius=1.2 \
+  habitat_baselines.rl.policy.coco_threshold="${VLFM_COCO_THRESHOLD:-0.8}" \
+  habitat_baselines.rl.policy.non_coco_threshold="${VLFM_NON_COCO_THRESHOLD:-0.4}" \
   habitat.task.measurements.success.success_distance="${SUCCESS_DISTANCE}" \
   habitat.task.lab_sensors.base_explorer.turn_angle=30 \
   habitat_baselines.num_environments=1 \

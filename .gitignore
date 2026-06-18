@@ -222,6 +222,9 @@ outputs/*
 /data/scene_datasets/hm3d/val/*
 !/data/scene_datasets/hm3d/val/00800-TEEsavR23oF/
 !/data/scene_datasets/hm3d/val/00800-TEEsavR23oF/**
+# cat-demo GLB-swap scratch (large backups / staging dirs — never commit)
+/data/scene_datasets/hm3d/val/00800-TEEsavR23oF/_incoming/
+/data/scene_datasets/hm3d/val/00800-TEEsavR23oF/backup_catv3_20260618/
 /data/*.pth
 /data/*.pt
 /data/*.engine
