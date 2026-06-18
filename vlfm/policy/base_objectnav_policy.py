@@ -2,7 +2,7 @@
 
 import os
 from dataclasses import dataclass, fields
-from typing import Any, Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import cv2
 import numpy as np
@@ -18,6 +18,7 @@ from vlfm.utils.geometry_utils import get_fov, rho_theta
 from vlfm.utils.goal_plan import Goal, GoalQueue, decompose
 from vlfm.utils.object_memory import recall_object, remember_object
 from vlfm.utils.path_planning import downsample_path, plan_path, rc_to_xy, snap_to_navigable, xy_to_rc
+from vlfm.vlm.attribute_verifier import AttributeVerifierClient, heuristic_verify, parse_objectnav_instruction
 from vlfm.vlm.blip2 import BLIP2Client
 from vlfm.vlm.coco_classes import COCO_CLASSES
 from vlfm.vlm.grounding_dino import GroundingDINOClient, ObjectDetections
@@ -94,6 +95,7 @@ class BaseObjectNavPolicy(BasePolicy):
         self._vqa_prompt = vqa_prompt
         self._coco_threshold = coco_threshold
         self._non_coco_threshold = non_coco_threshold
+        self._verifier = AttributeVerifierClient(port=int(os.environ.get("ATTR_VERIFIER_PORT", "12186")))
 
         self._num_steps = 0
         self._did_reset = False
@@ -112,6 +114,16 @@ class BaseObjectNavPolicy(BasePolicy):
         self._path_goal: Union[np.ndarray, None] = None
         self._waypoint_idx = 0
         self._last_plan_step = 0
+        self._instruction = ""
+        self._predicate = ""
+        self._predicate_parse_reason = ""
+        self._verification_enabled = False
+        self._attribute_verified = False
+        self._verify_calls = 0
+        self._last_verify_result = ""
+        self._last_target_crop: Optional[np.ndarray] = None
+        self._last_target_crop_step = -1
+        self._last_target_bbox: Optional[np.ndarray] = None
         self._compute_frontiers = compute_frontiers
         if compute_frontiers:
             self._obstacle_map = ObstacleMap(
@@ -140,6 +152,16 @@ class BaseObjectNavPolicy(BasePolicy):
         self._path_goal = None
         self._waypoint_idx = 0
         self._last_plan_step = 0
+        self._instruction = ""
+        self._predicate = ""
+        self._predicate_parse_reason = ""
+        self._verification_enabled = False
+        self._attribute_verified = False
+        self._verify_calls = 0
+        self._last_verify_result = ""
+        self._last_target_crop = None
+        self._last_target_crop_step = -1
+        self._last_target_bbox = None
         if self._compute_frontiers:
             self._obstacle_map.reset()
             self._load_persistent_obstacles()
@@ -184,6 +206,11 @@ class BaseObjectNavPolicy(BasePolicy):
         elif goal is not None:  # Found the target object -> go to it
             mode = "navigate"
             pointnav_action = self._navigate_to(goal[:2], observations, conservative=False)
+            if self._called_stop:
+                verified_action = self._verify_on_arrival(observations, robot_xy)
+                if verified_action is not None:
+                    mode = "verify-reject"
+                    pointnav_action = verified_action
         elif use_global and self._remembered_goal is not None:  # Recalled from memory (Module 2)
             mode = "navigate-memory"
             memory_conservative = os.environ.get("VLFM_MEMORY_NAV_CONSERVATIVE", "1") == "1"
@@ -197,6 +224,7 @@ class BaseObjectNavPolicy(BasePolicy):
             mode = "explore"
             pointnav_action = self._explore(observations)
 
+        mode, pointnav_action = self._guard_attribute_stop(mode, pointnav_action, observations, robot_xy)
         action_numpy = pointnav_action.detach().cpu().numpy()[0]
         if len(action_numpy) == 1:
             action_numpy = action_numpy[0]
@@ -224,6 +252,7 @@ class BaseObjectNavPolicy(BasePolicy):
                 self._apply_current_goal()
             else:
                 self._target_object = observations["objectgoal"]
+                self._configure_attribute_query(str(observations["objectgoal"]))
                 self._maybe_recall_object_memory()
         try:
             self._cache_observations(observations)
@@ -232,6 +261,56 @@ class BaseObjectNavPolicy(BasePolicy):
             print("Reached edge of map, stopping.")
             raise StopIteration
         self._policy_info = {}
+
+    def _configure_attribute_query(self, default_noun: str) -> None:
+        query = (
+            os.environ.get("VLFM_OBJECTNAV_QUERY")
+            or os.environ.get("VLFM_ATTR_QUERY")
+            or os.environ.get("VLFM_NAV_QUERY")
+            or ""
+        ).strip()
+        direct_predicate = os.environ.get("VLFM_ATTR_PREDICATE", "").strip()
+        direct_noun = os.environ.get("VLFM_ATTR_NOUN", "").strip()
+
+        if direct_predicate:
+            self._instruction = query or direct_predicate
+            self._predicate = direct_predicate
+            self._target_object = direct_noun or default_noun
+            self._predicate_parse_reason = "env"
+        elif query:
+            parsed = parse_objectnav_instruction(
+                query,
+                default_noun=direct_noun or default_noun,
+                timeout=float(os.environ.get("VLFM_ATTR_PARSE_TIMEOUT", "8")),
+            )
+            self._instruction = parsed.original
+            self._predicate = parsed.predicate
+            self._predicate_parse_reason = parsed.reason
+            if parsed.noun:
+                self._target_object = parsed.noun
+        else:
+            self._instruction = ""
+            self._predicate = ""
+            self._predicate_parse_reason = ""
+
+        self._verification_enabled = bool(self._predicate) and os.environ.get("VLFM_ATTR_VERIFY", "1") != "0"
+        if self._verification_enabled:
+            print(
+                f"[attr] query={self._instruction!r} noun={self._target_object!r} "
+                f"predicate={self._predicate!r} parse={self._predicate_parse_reason}",
+                flush=True,
+            )
+
+    def _get_value_target_text(self) -> str:
+        if self._predicate and os.environ.get("VLFM_ATTR_USE_VALUE_TEXT", "0") == "1":
+            predicate = self._predicate.strip()
+            lower = predicate.lower()
+            if lower.startswith("a "):
+                return predicate[2:].strip()
+            if lower.startswith("an "):
+                return predicate[3:].strip()
+            return predicate
+        return self._target_object
 
     def _initialize(self) -> Tensor:
         raise NotImplementedError
@@ -275,6 +354,108 @@ class BaseObjectNavPolicy(BasePolicy):
         remember_object(path, self._target_object, goal[:2], start_pose=self._get_memory_start_pose())
         self._memory_written.add(self._target_object)
         print(f"[memory] remembered {self._target_object} at {goal[:2].tolist()} in {path}")
+
+    def _should_verify_on_arrival(self) -> bool:
+        return self._verification_enabled and bool(self._predicate) and bool(self._target_object)
+
+    def _verify_on_arrival(self, observations: "TensorDict", robot_xy: np.ndarray) -> Union[None, Tensor]:
+        if not self._should_verify_on_arrival():
+            return None
+
+        max_calls = int(os.environ.get("VLFM_ATTR_MAX_VERIFY_CALLS", "5"))
+        if self._verify_calls >= max_calls:
+            self._last_verify_result = f"verify skipped: max calls {max_calls} reached"
+            print(f"[attr] {self._last_verify_result}", flush=True)
+            return None
+
+        crop = self._get_arrival_crop()
+        if crop is None:
+            self._last_verify_result = "verify skipped: no target crop"
+            print(f"[attr] {self._last_verify_result}", flush=True)
+            if os.environ.get("VLFM_ATTR_FAIL_OPEN", "1") == "1":
+                return None
+            return self._reject_and_continue(observations, robot_xy, reason=self._last_verify_result)
+
+        self._verify_calls += 1
+        timeout = float(os.environ.get("VLFM_ATTR_VERIFY_TIMEOUT", "3.0"))
+        verdict = self._verifier.verify(crop, self._predicate, timeout=timeout)
+        if verdict is None:
+            verdict = heuristic_verify(crop, self._predicate).to_json()
+
+        match = bool(verdict.get("match"))
+        source = str(verdict.get("source", "unknown"))
+        reason = str(verdict.get("reason", "")).strip()
+        self._last_verify_result = f"verify[{source}] match={match}: {reason}"
+        print(f"[attr] {self._last_verify_result}", flush=True)
+        if match:
+            self._attribute_verified = True
+            return None
+        return self._reject_and_continue(observations, robot_xy, reason=self._last_verify_result)
+
+    def _guard_attribute_stop(
+        self,
+        mode: str,
+        action: Tensor,
+        observations: "TensorDict",
+        robot_xy: np.ndarray,
+    ) -> Tuple[str, Tensor]:
+        if not self._should_verify_on_arrival() or self._attribute_verified or not self._is_stop_action(action):
+            return mode, action
+
+        if self._called_stop:
+            verified_action = self._verify_on_arrival(observations, robot_xy)
+            if verified_action is None:
+                return mode, action
+            if self._is_stop_action(verified_action):
+                return self._block_unverified_stop(mode)
+            return "verify-reject", verified_action
+
+        return self._block_unverified_stop(mode)
+
+    def _is_stop_action(self, action: Any) -> bool:
+        if isinstance(action, torch.Tensor) and isinstance(self._stop_action, torch.Tensor):
+            action_np = action.detach().cpu().numpy()
+            stop_np = self._stop_action.detach().cpu().numpy()
+            return action_np.shape == stop_np.shape and np.array_equal(action_np, stop_np)
+        return action == self._stop_action
+
+    def _block_unverified_stop(self, mode: str) -> Tuple[str, Tensor]:
+        self._called_stop = False
+        self._last_verify_result = f"verify guard blocked unverified STOP from mode={mode}"
+        print(f"[attr] {self._last_verify_result}", flush=True)
+        return "verify-guard", self._turn_right_action()
+
+    def _turn_right_action(self) -> Tensor:
+        if isinstance(self._stop_action, torch.Tensor):
+            action = torch.zeros_like(self._stop_action)
+            action[..., 0] = 3
+            return action
+        return "TURN_RIGHT"
+
+    def _get_arrival_crop(self) -> Optional[np.ndarray]:
+        if self._last_target_crop is None:
+            return None
+        max_age = int(os.environ.get("VLFM_ATTR_CROP_MAX_AGE", "80"))
+        if self._num_steps - self._last_target_crop_step > max_age:
+            return None
+        return self._last_target_crop
+
+    def _reject_and_continue(
+        self,
+        observations: "TensorDict",
+        robot_xy: np.ndarray,
+        reason: str = "",
+    ) -> Tensor:
+        reject_xy = self._last_goal if not np.array_equal(self._last_goal, np.zeros(2)) else robot_xy
+        radius = float(os.environ.get("VLFM_ATTR_REJECT_RADIUS", "0.6"))
+        self._object_map.reject_region(self._target_object, reject_xy, radius=radius)
+        print(
+            f"[attr] reject {self._target_object!r} around {np.round(reject_xy, 3).tolist()} "
+            f"r={radius:.2f} reason={reason}",
+            flush=True,
+        )
+        self._reset_per_goal_nav()
+        return self._explore(observations)
 
     def _act_multi_goal(self, observations: "TensorDict", robot_xy: np.ndarray) -> Tuple[str, Tensor]:
         """Module 4: drive toward the current goal in the ordered plan. When a goal
@@ -407,6 +588,15 @@ class BaseObjectNavPolicy(BasePolicy):
                 "target_object",
             ],
         }
+        if self._instruction:
+            policy_info["instruction"] = f"instruction: {self._instruction}"
+            policy_info["render_below_images"].append("instruction")
+        if self._predicate:
+            policy_info["attribute_predicate"] = f"predicate: {self._predicate}"
+            policy_info["render_below_images"].append("attribute_predicate")
+        if self._last_verify_result:
+            policy_info["attribute_verify"] = self._last_verify_result
+            policy_info["render_below_images"].append("attribute_verify")
 
         if not self._visualize:
             return policy_info
@@ -696,6 +886,7 @@ class BaseObjectNavPolicy(BasePolicy):
                     continue
 
             self._object_masks[object_mask > 0] = 1
+            self._cache_target_crop(rgb, bbox_denorm, object_mask)
             self._object_map.update_map(
                 self._target_object,
                 depth,
@@ -711,6 +902,27 @@ class BaseObjectNavPolicy(BasePolicy):
         self._object_map.update_explored(tf_camera_to_episodic, max_depth, cone_fov)
 
         return detections
+
+    def _cache_target_crop(self, rgb: np.ndarray, bbox_xyxy: np.ndarray, object_mask: np.ndarray) -> None:
+        height, width = rgb.shape[:2]
+        x1, y1, x2, y2 = np.asarray(bbox_xyxy, dtype=np.float64)
+        box_w = max(1.0, x2 - x1)
+        box_h = max(1.0, y2 - y1)
+        margin = float(os.environ.get("VLFM_ATTR_CROP_MARGIN", "0.15"))
+        x1 = int(max(0, np.floor(x1 - margin * box_w)))
+        y1 = int(max(0, np.floor(y1 - margin * box_h)))
+        x2 = int(min(width, np.ceil(x2 + margin * box_w)))
+        y2 = int(min(height, np.ceil(y2 + margin * box_h)))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        crop = rgb[y1:y2, x1:x2].copy()
+        if os.environ.get("VLFM_ATTR_MASK_CROP", "0") == "1":
+            mask_crop = object_mask[y1:y2, x1:x2] > 0
+            crop = np.where(mask_crop[..., None], crop, 255).astype(np.uint8)
+        self._last_target_crop = crop
+        self._last_target_crop_step = self._num_steps
+        self._last_target_bbox = np.array([x1, y1, x2, y2], dtype=np.int32)
 
     def _cache_observations(self, observations: "TensorDict") -> None:
         """Extracts the rgb, depth, and camera transform from the observations.

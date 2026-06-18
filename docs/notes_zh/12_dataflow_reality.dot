@@ -1,0 +1,53 @@
+digraph VLFM_RT {
+    rankdir=TB; compound=true;
+    graph [fontname="Noto Sans CJK SC", fontsize=15, bgcolor="white", labelloc="t",
+           label="VLFM 真机(Spot)数据流 · 分工交付接口",
+           nodesep=0.35, ranksep=0.55];
+    node  [fontname="Noto Sans CJK SC", fontsize=12, shape=box,
+           style="rounded,filled", color="#666666", penwidth=1.1];
+    edge  [fontname="Noto Sans CJK SC", fontsize=10, color="#555555"];
+
+    // ===== 感知 / 建图组 =====
+    subgraph cluster_perc {
+        label="感知 / 建图组 —— 机身 5 路深度（下面随便 RGBD / LIDAR / SLAM）";
+        style="rounded,filled"; fillcolor="#EAF2FB"; color="#3B6EA5"; fontsize=12;
+        BD   [label="5 路机身深度\nuint16 毫米", fillcolor="#D6E6F7"];
+        POSE [label="位姿 tf\nglobal → episodic", fillcolor="#D6E6F7"];
+        OBS  [label="★ 障碍图（缝 A）\n2D 0/1 俯视栅格\n1000×1000 · 5cm/格",
+              fillcolor="#F9D199", color="#D98A2B", penwidth=2.2];
+        FR   [label="frontier\n一串 (x,y) 米", fillcolor="#D9EBD3"];
+        BD -> OBS -> FR;
+    }
+
+    // ===== 语义 / 检测组 =====
+    subgraph cluster_sem {
+        label="语义 / 检测组 —— 只吃臂上眼 RGB（不碰深度）";
+        style="rounded,filled"; fillcolor="#F6F1F7"; color="#8A668A"; fontsize=12;
+        HC  [label="臂上眼 RGB\n(480,640,3) uint8", fillcolor="#E6DAF0"];
+        ZOE [label="ZoeDepth 单目\n给臂上眼补 D", fillcolor="#E6DAF0"];
+        VAL [label="★ 价值图\n同坐标系 · 每格语义分 float",
+             fillcolor="#F9D199", color="#D98A2B", penwidth=2.2];
+        OBJ [label="目标点\n(x,y) 米", fillcolor="#D8C4EC"];
+        HC -> VAL;
+        HC -> ZOE -> OBJ;
+    }
+
+    // ===== 决策 + 运动组 =====
+    subgraph cluster_act {
+        label="决策 + 运动组";
+        style="rounded,filled"; fillcolor="#FBEEEE"; color="#A5443B"; fontsize=12;
+        DEC [label="找到目标？", shape=diamond, fillcolor="#F5CFCB"];
+        PN  [label="PointNav 网络头\nGaussianNet(2)+tanh\n→ (1,2) float [-1,1]", fillcolor="#F3D7D3"];
+        ACT [label="set_base_position\n相对位移 ≤ 0.25m / 30°", fillcolor="#F3D7D3"];
+        DEC -> PN -> ACT;
+    }
+
+    // ===== 跨组数据流 =====
+    POSE -> OBS [style=dashed, label="tf 对齐"];
+    POSE -> VAL [style=dashed, label="tf 对齐"];
+    OBS  -> VAL [style=dashed, constraint=false, label="共享 BEV 画布坐标系",
+                 color="#D98A2B", fontcolor="#B5701F", penwidth=1.6];
+    FR  -> DEC [label="候选方向"];
+    VAL -> DEC [label="打分"];
+    OBJ -> DEC [label="目标 xy"];
+}

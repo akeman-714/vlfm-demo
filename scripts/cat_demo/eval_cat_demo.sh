@@ -40,6 +40,11 @@ TS="$(date +%Y%m%d_%H%M%S)"
 VIDEO_DIR="${VIDEO_DIR:-video_dir/cat_demo_${TS}}"
 TB_DIR="${TB_DIR:-tb/cat_demo_${TS}}"
 LOG="${LOG:-outputs/cat_demo_${TS}.log}"
+POINTNAV_POLICY_PATH="${POINTNAV_POLICY_PATH:-data/pointnav_weights.pth}"
+if [ ! -f "${POINTNAV_POLICY_PATH}" ] && [ -f "/data/jinsong.yuan/vlfm-demo/habitat-pointnav-demo/data/pointnav_weights.pth" ]; then
+  POINTNAV_POLICY_PATH="/data/jinsong.yuan/vlfm-demo/habitat-pointnav-demo/data/pointnav_weights.pth"
+fi
+SUCCESS_DISTANCE="${SUCCESS_DISTANCE:-0.5}"
 
 mkdir -p "${VIDEO_DIR}" "${TB_DIR}" "$(dirname "${LOG}")"
 
@@ -50,6 +55,8 @@ echo ">>> split=${SPLIT}  N_EP=${N_EP}"
 echo ">>> video_dir=${VIDEO_DIR}"
 echo ">>> tb_dir   =${TB_DIR}"
 echo ">>> log      =${LOG}"
+echo ">>> pointnav =${POINTNAV_POLICY_PATH}"
+echo ">>> success_distance=${SUCCESS_DISTANCE}"
 echo
 
 echo "-- episode pose --"
@@ -88,7 +95,11 @@ nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tail -n +2 |
   { gsub(/ /,""); idx=$1; if (idx in want) print "  GPU "$1": used="$2" free="$3 }'
 
 echo "-- VLM health probes --"
-for port in 12181 12182 12183 12184; do
+health_ports=(12181 12182 12183 12184)
+if [ "${VLFM_ATTR_VERIFY:-0}" != "0" ] && { [ -n "${VLFM_OBJECTNAV_QUERY:-}" ] || [ -n "${VLFM_ATTR_QUERY:-}" ] || [ -n "${VLFM_ATTR_PREDICATE:-}" ]; }; then
+  health_ports+=("${ATTR_VERIFIER_PORT:-12186}")
+fi
+for port in "${health_ports[@]}"; do
   code=$(curl -s -o /dev/null --max-time 2 -w '%{http_code}' "http://127.0.0.1:${port}/" || true)
   if [ -n "${code}" ] && [ "${code}" != "000" ]; then
     echo "  port ${port}: up (HTTP ${code})"
@@ -110,8 +121,9 @@ python -um vlfm.run \
   habitat_baselines.eval_ckpt_path_dir=data/dummy_policy.pth \
   habitat_baselines.load_resume_state_config=False \
   habitat_baselines.rl.policy.name=HabitatITMPolicyV2 \
+  habitat_baselines.rl.policy.pointnav_policy_path="${POINTNAV_POLICY_PATH}" \
   habitat_baselines.rl.policy.pointnav_stop_radius=1.2 \
-  habitat.task.measurements.success.success_distance=0.5 \
+  habitat.task.measurements.success.success_distance="${SUCCESS_DISTANCE}" \
   habitat.task.lab_sensors.base_explorer.turn_angle=30 \
   habitat_baselines.num_environments=1 \
   habitat_baselines.eval.split="${SPLIT}" \

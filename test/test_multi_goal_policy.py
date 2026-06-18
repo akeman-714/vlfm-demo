@@ -71,23 +71,23 @@ def test_multi_goal_full_sequence() -> None:
 
             robot = np.zeros(2)
 
-            # Step 1: reach origin#0 -> advance to fridge (unknown) -> explore.
+            # Step 1: reach origin#0 -> advance to refrigerator (unknown) -> explore.
             f._arrive = True
             mode, action = f._act_multi_goal({}, robot)
-            assert f._goal_queue.index == 1 and f._target_object == "fridge"
+            assert f._goal_queue.index == 1 and f._target_object == "refrigerator"
             assert action == "EXPLORE" and mode.endswith("explore")
             assert f._called_stop is False
 
-            # Step 2: fridge now detected -> navigate (not yet arrived).
-            f._detect = {"fridge": np.array([3.0, 3.0])}
+            # Step 2: refrigerator now detected -> navigate (not yet arrived).
+            f._detect = {"refrigerator": np.array([3.0, 3.0])}
             mode, action = f._act_multi_goal({}, robot)
             assert f._goal_queue.index == 1 and action == "MOVE" and mode.endswith("navigate")
 
-            # Step 3: reach fridge -> persist it -> advance to cat (known) -> memory nav.
+            # Step 3: reach refrigerator -> persist it -> advance to cat (known) -> memory nav.
             f._arrive = True
             mode, action = f._act_multi_goal({}, robot)
             assert f._goal_queue.index == 2 and f._target_object == "cat"
-            assert recall_object(mem, "fridge") is not None  # remembered on arrival
+            assert recall_object(mem, "refrigerator") is not None  # remembered on arrival
             assert f._remembered_goal is not None and np.allclose(f._remembered_goal, [5.0, 5.0])
             assert action == "MOVE" and mode.endswith("memory")
 
@@ -110,7 +110,7 @@ def test_unknown_object_without_memory_explores() -> None:
     f = _make_fake("")
     f._goal_queue = GoalQueue(decompose("fridge"))
     f._apply_current_goal()
-    assert f._target_object == "fridge" and f._remembered_goal is None
+    assert f._target_object == "refrigerator" and f._remembered_goal is None
     mode, action = f._act_multi_goal({}, np.zeros(2))
     assert action == "EXPLORE" and mode.endswith("explore")
 

@@ -1,6 +1,6 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
-from typing import Dict, Union
+from typing import Dict, List, Tuple, Union
 
 import cv2
 import numpy as np
@@ -21,10 +21,12 @@ class ObjectPointCloudMap:
     def __init__(self, erosion_size: float) -> None:
         self._erosion_size = erosion_size
         self.last_target_coord: Union[np.ndarray, None] = None
+        self._rejected: Dict[str, List[Tuple[np.ndarray, float]]] = {}
 
     def reset(self) -> None:
         self.clouds = {}
         self.last_target_coord = None
+        self._rejected = {}
 
     def has_object(self, target_class: str) -> bool:
         return target_class in self.clouds and len(self.clouds[target_class]) > 0
@@ -64,6 +66,8 @@ class ObjectPointCloudMap:
 
         curr_position = tf_camera_to_episodic[:3, 3]
         closest_point = self._get_closest_point(global_cloud, curr_position)
+        if self._in_rejected(object_name, closest_point[:2]):
+            return
         dist = np.linalg.norm(closest_point[:3] - curr_position)
         if dist < 1.0:
             # Object is too close to trust as a valid object
@@ -73,6 +77,24 @@ class ObjectPointCloudMap:
             self.clouds[object_name] = np.concatenate((self.clouds[object_name], global_cloud), axis=0)
         else:
             self.clouds[object_name] = global_cloud
+
+    def reject_region(self, object_name: str, xy: np.ndarray, radius: float = 0.5) -> None:
+        """Reject an object instance region so future observations do not revive it."""
+        xy = np.asarray(xy, dtype=np.float64)[:2]
+        self._rejected.setdefault(object_name, []).append((xy, float(radius)))
+        if object_name not in self.clouds:
+            return
+        keep = np.linalg.norm(self.clouds[object_name][:, :2] - xy, axis=1) > radius
+        self.clouds[object_name] = self.clouds[object_name][keep]
+        if self.last_target_coord is not None and np.linalg.norm(self.last_target_coord - xy) <= radius:
+            self.last_target_coord = None
+
+    def _in_rejected(self, object_name: str, xy: np.ndarray) -> bool:
+        xy = np.asarray(xy, dtype=np.float64)[:2]
+        for center, radius in self._rejected.get(object_name, []):
+            if np.linalg.norm(xy - center) <= radius:
+                return True
+        return False
 
     def get_best_object(self, target_class: str, curr_position: np.ndarray) -> np.ndarray:
         target_cloud = self.get_target_cloud(target_class)

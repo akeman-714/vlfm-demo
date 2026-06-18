@@ -194,7 +194,7 @@ class BaseITMPolicy(BaseObjectNavPolicy):
             [
                 self._itm.cosine(
                     rgb,
-                    p.replace("target_object", self._target_object.replace("|", "/")),
+                    p.replace("target_object", self._get_value_target_text().replace("|", "/")),
                 )
                 for p in self._text_prompt.split(PROMPT_SEPARATOR)
             ]
@@ -242,7 +242,7 @@ class ITMPolicy(BaseITMPolicy):
         self, observations: "TensorDict", frontiers: np.ndarray
     ) -> Tuple[np.ndarray, List[float]]:
         rgb = self._observations_cache["object_map_rgbd"][0][0]
-        text = self._text_prompt.replace("target_object", self._target_object)
+        text = self._text_prompt.replace("target_object", self._get_value_target_text())
         self._frontier_map.update(frontiers, rgb, text)  # type: ignore
         return self._frontier_map.sort_waypoints()
 

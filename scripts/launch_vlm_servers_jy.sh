@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 自定义版：启动 4 个 VLM Flask 服务，全部固定到 GPU 0。
+# 自定义版：启动 4 个 VLM Flask 服务，全部固定到 GPU 0；可选启动属性验证 API 服务。
 #   - GDINO / BLIP2ITM / SAM 跑在 vlfm_pip 环境。
 #   - YOLO(COCO 检测) 已换成 YOLO26+TensorRT，跑在独立的 yolo_trt 环境(端口不变 12184)。
 # 用法：bash scripts/launch_vlm_servers_jy.sh [GPU_ID]
@@ -7,7 +7,8 @@
 # 回滚到老 YOLOv7：把 0.3 pane 的 yolo_prefix/yolo_trt 换回 ${prefix} + vlfm.vlm.yolov7。
 #
 # ITM 后端切换(默认 siglip2,协议完全兼容,下游 policy/value_map/reality 都不用改)：
-#   bash scripts/launch_vlm_servers_jy.sh 0                     # 默认:SigLIP2-base ITM(siglip2_itm)
+#   bash scripts/launch_vlm_servers_jy.sh 0                     # 默认:SigLIP2 edge(table) ITM
+#   SIGLIP_FORM=full bash scripts/launch_vlm_servers_jy.sh 0    # 任意开放词 prompt,如 "yellow cat"
 #   ITM_BACKEND=blip2 bash scripts/launch_vlm_servers_jy.sh 0   # 回滚:BLIP2-ITM(vlfm_pip)
 set -euo pipefail
 
@@ -27,6 +28,10 @@ if [ ! -d "${DEFAULT_SIGLIP_MODEL_ID}" ]; then
   DEFAULT_SIGLIP_MODEL_ID="google/siglip2-base-patch16-384"
 fi
 SIGLIP_MODEL_ID="${SIGLIP_MODEL_ID:-${DEFAULT_SIGLIP_MODEL_ID}}"
+SIGLIP_FORM="${SIGLIP_FORM:-edge}"
+SIGLIP_VISION_ENGINE="${SIGLIP_VISION_ENGINE:-data/siglip2_vision_b16_384_fp16.engine}"
+SIGLIP_TEXT_ENGINE="${SIGLIP_TEXT_ENGINE:-data/siglip2_text_b16_fp16.engine}"
+SIGLIP_TEXT_TABLE="${SIGLIP_TEXT_TABLE:-data/siglip2_text_coco80_fp16.npy}"
 
 export MOBILE_SAM_CHECKPOINT="${MOBILE_SAM_CHECKPOINT:-data/mobile_sam.pt}"
 export GROUNDING_DINO_CONFIG="${GROUNDING_DINO_CONFIG:-GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py}"
@@ -36,6 +41,8 @@ export GROUNDING_DINO_PORT="${GROUNDING_DINO_PORT:-12181}"
 export BLIP2ITM_PORT="${BLIP2ITM_PORT:-12182}"
 export SAM_PORT="${SAM_PORT:-12183}"
 export YOLOV7_PORT="${YOLOV7_PORT:-12184}"
+export ATTR_VERIFIER_PORT="${ATTR_VERIFIER_PORT:-12186}"
+ENABLE_ATTR_VERIFIER="${ENABLE_ATTR_VERIFIER:-0}"
 
 # 国内访问 huggingface.co 不通时走镜像
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -49,7 +56,29 @@ prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${CONDA_ENV} && e
 yolo_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${YOLO_TRT_ENV} && export CUDA_VISIBLE_DEVICES=${GPU_ID} && export PYTHONPATH=${REPO_DIR}"
 
 # SigLIP2 pane 用独立 env + PYTHONPATH(不必把整个 vlfm pip 装进新 env),避免污染 vlfm_pip 的 transformers==4.26.0。
-siglip_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${SIGLIP_CONDA_ENV} && export CUDA_VISIBLE_DEVICES=${GPU_ID} && export PYTHONPATH=${REPO_DIR} && export HF_ENDPOINT='${HF_ENDPOINT}' && export SIGLIP_MODEL_ID='${SIGLIP_MODEL_ID}'"
+siglip_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${SIGLIP_CONDA_ENV} && export CUDA_VISIBLE_DEVICES=${GPU_ID} && export PYTHONPATH=${REPO_DIR} && export HF_ENDPOINT='${HF_ENDPOINT}' && export SIGLIP_MODEL_ID='${SIGLIP_MODEL_ID}' && export SIGLIP_VISION_ENGINE='${SIGLIP_VISION_ENGINE}'"
+
+# 属性验证服务只转发小 crop 到云侧 API,不需要 GPU；API key 从 tmux 继承的环境变量读取。
+attr_prefix="cd ${REPO_DIR} && source ${CONDA_SH} && conda activate ${CONDA_ENV} && export PYTHONPATH=${REPO_DIR}"
+
+# SigLIP2 deployment form:
+#   edge = vision TRT + offline COCO text table (low memory, table prompts only)
+#   full = vision TRT + text TRT engine (arbitrary runtime prompts)
+case "${SIGLIP_FORM}" in
+  edge)
+    siglip_prefix="${siglip_prefix} && export SIGLIP_TEXT_TABLE='${SIGLIP_TEXT_TABLE}' && unset SIGLIP_TEXT_ENGINE"
+    ;;
+  full)
+    siglip_prefix="${siglip_prefix} && unset SIGLIP_TEXT_TABLE && export SIGLIP_TEXT_ENGINE='${SIGLIP_TEXT_ENGINE}'"
+    ;;
+  torch)
+    siglip_prefix="${siglip_prefix} && unset SIGLIP_VISION_ENGINE SIGLIP_TEXT_TABLE SIGLIP_TEXT_ENGINE"
+    ;;
+  *)
+    echo "Unknown SIGLIP_FORM=${SIGLIP_FORM}; expected edge, full, or torch" >&2
+    exit 1
+    ;;
+esac
 
 # 按 ITM_BACKEND 选 12182 pane 的命令。校验放在建 tmux session 之前,避免留下半启动的会话。
 case "${ITM_BACKEND}" in
@@ -69,18 +98,33 @@ tmux new-session -d -s "${session_name}"
 tmux split-window -v -t "${session_name}:0"
 tmux split-window -h -t "${session_name}:0.0"
 tmux split-window -h -t "${session_name}:0.2"
+if [ "${ENABLE_ATTR_VERIFIER}" = "1" ]; then
+  tmux split-window -v -t "${session_name}:0.3"
+fi
 
 tmux send-keys -t "${session_name}:0.0" "${prefix} && python -m vlfm.vlm.grounding_dino --port ${GROUNDING_DINO_PORT}" C-m
 tmux send-keys -t "${session_name}:0.1" "${itm_cmd}" C-m
 tmux send-keys -t "${session_name}:0.2" "${prefix} && python -m vlfm.vlm.sam           --port ${SAM_PORT}"           C-m
 tmux send-keys -t "${session_name}:0.3" "${yolo_prefix} && python -m vlfm.vlm.yolo_trt --port ${YOLOV7_PORT} --model ${YOLO_TRT_MODEL}" C-m
+if [ "${ENABLE_ATTR_VERIFIER}" = "1" ]; then
+  tmux send-keys -t "${session_name}:0.4" "${attr_prefix} && python -m vlfm.vlm.attribute_verifier --port ${ATTR_VERIFIER_PORT}" C-m
+fi
 
 echo "Started tmux session: ${session_name}  (GPU ${GPU_ID})"
 echo "ITM backend: ${ITM_BACKEND}  (port ${BLIP2ITM_PORT}, route /blip2itm)"
 if [ "${ITM_BACKEND}" = "siglip2" ]; then
-  echo "  SigLIP2 env=${SIGLIP_CONDA_ENV}  model=${SIGLIP_MODEL_ID}"
+  echo "  SigLIP2 env=${SIGLIP_CONDA_ENV}  model=${SIGLIP_MODEL_ID}  form=${SIGLIP_FORM}"
+  echo "  vision_engine=${SIGLIP_VISION_ENGINE}"
+  if [ "${SIGLIP_FORM}" = "full" ]; then
+    echo "  text_engine=${SIGLIP_TEXT_ENGINE}"
+  elif [ "${SIGLIP_FORM}" = "edge" ]; then
+    echo "  text_table=${SIGLIP_TEXT_TABLE}"
+  fi
 fi
 echo "Ports: GDINO=${GROUNDING_DINO_PORT}  BLIP2ITM=${BLIP2ITM_PORT}  SAM=${SAM_PORT}  YOLO26-TRT=${YOLOV7_PORT}"
+if [ "${ENABLE_ATTR_VERIFIER}" = "1" ]; then
+  echo "       ATTR_VERIFIER=${ATTR_VERIFIER_PORT}  (route /verify)"
+fi
 echo "Attach:  tmux attach -t ${session_name}"
 echo "Kill:    tmux kill-session -t ${session_name}"
 echo "Wait ~60-90s for weights to load before running vlfm.run."
