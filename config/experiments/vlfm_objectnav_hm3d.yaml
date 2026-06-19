@@ -27,6 +27,21 @@ habitat:
     lab_sensors:
       base_explorer:
         turn_angle: 30
+  # Hi-res RGB/depth so the YOLO26 detector sees a sharper image (640x480 -> 960x720,
+  # same 4:3 ratio so hfov/intrinsics stay consistent; fx/fy auto-recompute from
+  # depth_sensor.width in habitat_policies.py). rgb and depth are kept the SAME size
+  # (every value/object-map path assumes rgb.shape == depth.shape). The pointnav net
+  # still gets depth resized to 224x224 internally, so this only sharpens detection.
+  simulator:
+    agents:
+      main_agent:
+        sim_sensors:
+          rgb_sensor:
+            width: 960
+            height: 720
+          depth_sensor:
+            width: 960
+            height: 720
 
 habitat_baselines:
   evaluate: True

@@ -18,7 +18,10 @@ CONDA_SH="${CONDA_SH:-/data/jinsong.yuan/miniconda3/etc/profile.d/conda.sh}"
 CONDA_ENV="${CONDA_ENV:-vlfm_pip}"
 # YOLO26+TensorRT 检测器跑在自己的 env(ultralytics+tensorrt),不污染 vlfm_pip。
 YOLO_TRT_ENV="${YOLO_TRT_ENV:-yolo_trt}"
-YOLO_TRT_MODEL="${YOLO_TRT_MODEL:-data/yolo26l.engine}"
+# Hi-res 960 引擎(配 960x720 sensor);回滚到 640: YOLO_TRT_MODEL=data/yolo26l.engine YOLO_TRT_IMGSZ=640
+YOLO_TRT_MODEL="${YOLO_TRT_MODEL:-data/yolo26l_960.engine}"
+# 必须与引擎 export 时的 imgsz 一致,否则 ultralytics 会按错误尺寸 letterbox。
+YOLO_TRT_IMGSZ="${YOLO_TRT_IMGSZ:-960}"
 
 # ITM(图文相似度,value map 用)后端可切换：默认 siglip2;blip2 仍可一键回滚。
 ITM_BACKEND="${ITM_BACKEND:-siglip2}"
@@ -105,7 +108,7 @@ fi
 tmux send-keys -t "${session_name}:0.0" "${prefix} && python -m vlfm.vlm.grounding_dino --port ${GROUNDING_DINO_PORT}" C-m
 tmux send-keys -t "${session_name}:0.1" "${itm_cmd}" C-m
 tmux send-keys -t "${session_name}:0.2" "${prefix} && python -m vlfm.vlm.sam           --port ${SAM_PORT}"           C-m
-tmux send-keys -t "${session_name}:0.3" "${yolo_prefix} && python -m vlfm.vlm.yolo_trt --port ${YOLOV7_PORT} --model ${YOLO_TRT_MODEL}" C-m
+tmux send-keys -t "${session_name}:0.3" "${yolo_prefix} && python -m vlfm.vlm.yolo_trt --port ${YOLOV7_PORT} --model ${YOLO_TRT_MODEL} --imgsz ${YOLO_TRT_IMGSZ}" C-m
 if [ "${ENABLE_ATTR_VERIFIER}" = "1" ]; then
   tmux send-keys -t "${session_name}:0.4" "${attr_prefix} && python -m vlfm.vlm.attribute_verifier --port ${ATTR_VERIFIER_PORT}" C-m
 fi
