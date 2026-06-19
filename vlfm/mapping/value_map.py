@@ -186,6 +186,62 @@ class ValueMap(BaseMap):
 
         return sorted_frontiers, sorted_values
 
+    def best_navigable_value_xy(
+        self,
+        obstacle_map: "ObstacleMap",  # type: ignore # noqa: F821
+        exclude: Optional[List[np.ndarray]] = None,
+        exclude_radius: float = 1.5,
+        grid_step_m: float = 0.4,
+        radius: float = 0.5,
+        reduce_fn: Optional[Callable] = None,
+    ) -> Optional[Tuple[np.ndarray, float]]:
+        """Return the navigable+explored ``(x, y)`` cell with the highest target value.
+
+        Used for value-map-guided re-inspection: when frontier exploration is
+        exhausted but the target was never confirmed, the policy re-approaches the
+        most target-like spot the value map ever saw. Reuses the exact same value
+        lookup as frontier ranking (``sort_waypoints``) so the coordinate
+        convention matches the rest of the policy.
+
+        Args:
+            obstacle_map: Shares this map's grid; supplies the navigable + explored
+                mask and the canonical ``_px_to_xy`` conversion.
+            exclude: ``(x, y)`` points (already-inspected duds, current pose) to keep
+                away from; candidates within ``exclude_radius`` of any are dropped.
+            exclude_radius: Exclusion radius in meters.
+            grid_step_m: Sub-sampling stride over navigable cells (meters), to keep
+                the per-call ``sort_waypoints`` loop cheap.
+            radius: Radius (meters) over which each candidate's value is pooled.
+            reduce_fn: Channel reduction for multi-channel value maps; defaults to
+                max over channels.
+
+        Returns:
+            ``(xy, value)`` of the best candidate, or ``None`` if none qualifies.
+        """
+        navigable = obstacle_map._navigable_map.astype(bool) & obstacle_map.explored_area.astype(bool)
+        if not navigable.any():
+            return None
+        rows, cols = np.nonzero(navigable)
+        step = max(1, int(grid_step_m * self.pixels_per_meter))
+        sub = (rows % step == 0) & (cols % step == 0)
+        rows, cols = rows[sub], cols[sub]
+        if len(rows) == 0:
+            return None
+        candidates_xy = obstacle_map._px_to_xy(np.stack([rows, cols], axis=1))
+        if exclude:
+            keep = np.ones(len(candidates_xy), dtype=bool)
+            for ex in exclude:
+                keep &= np.linalg.norm(candidates_xy - np.asarray(ex, dtype=np.float64)[:2], axis=1) > exclude_radius
+            candidates_xy = candidates_xy[keep]
+            if len(candidates_xy) == 0:
+                return None
+        if reduce_fn is None and self._value_channels > 1:
+            reduce_fn = lambda vals: [float(np.max(v)) for v in vals]  # noqa: E731
+        sorted_xy, sorted_values = self.sort_waypoints(candidates_xy, radius, reduce_fn=reduce_fn)
+        if len(sorted_xy) == 0:
+            return None
+        return sorted_xy[0], float(sorted_values[0])
+
     def visualize(
         self,
         markers: Optional[List[Tuple[np.ndarray, Dict[str, Any]]]] = None,

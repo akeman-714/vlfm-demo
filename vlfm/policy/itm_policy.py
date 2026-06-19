@@ -1,7 +1,7 @@
 # Copyright (c) 2023 Boston Dynamics AI Institute LLC. All rights reserved.
 
 import os
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
@@ -53,6 +53,10 @@ class BaseITMPolicy(BaseObjectNavPolicy):
             obstacle_map=self._obstacle_map if sync_explored_areas else None,
         )
         self._acyclic_enforcer = AcyclicEnforcer()
+        # Value-map-guided re-inspection state (opt-in via VLFM_REINSPECT=1).
+        self._reinspect_target: Optional[np.ndarray] = None
+        self._reinspect_done: List[np.ndarray] = []
+        self._reinspect_count: int = 0
 
     def _reset(self) -> None:
         super()._reset()
@@ -60,18 +64,94 @@ class BaseITMPolicy(BaseObjectNavPolicy):
         self._acyclic_enforcer = AcyclicEnforcer()
         self._last_value = float("-inf")
         self._last_frontier = np.zeros(2)
+        self._reinspect_target = None
+        self._reinspect_done = []
+        self._reinspect_count = 0
 
     def _explore(self, observations: Union[Dict[str, Tensor], "TensorDict"]) -> Tensor:
         frontiers = self._observations_cache["frontier_sensor"]
         if np.array_equal(frontiers, np.zeros((1, 2))) or len(frontiers) == 0:
+            # Exploration is exhausted. Before giving up, optionally re-approach the
+            # most target-like spot the value map ever saw (a missed detection may be
+            # recoverable from a closer / different angle). Opt-in via VLFM_REINSPECT=1.
+            reinspect_action = self._maybe_reinspect(observations)
+            if reinspect_action is not None:
+                return reinspect_action
             print("No frontiers found during exploration, stopping.")
             return self._stop_action
+        # Fresh frontiers exist -> normal exploration resumes; drop any pending
+        # re-inspection target (we re-pick the best peak if we exhaust again later).
+        self._reinspect_target = None
         best_frontier, best_value = self._get_best_frontier(observations, frontiers)
         os.environ["DEBUG_INFO"] = f"Best value: {best_value*100:.2f}%"
         print(f"Best value: {best_value*100:.2f}%")
         pointnav_action = self._pointnav(best_frontier, stop=False)
 
         return pointnav_action
+
+    def _maybe_reinspect(self, observations: Union[Dict[str, Tensor], "TensorDict"]) -> Optional[Tensor]:
+        """Value-map-guided re-inspection (opt-in via VLFM_REINSPECT=1).
+
+        When frontier exploration is exhausted but the target was never confirmed,
+        navigate to the most target-like cell the value map ever saw instead of
+        stopping. Getting closer / changing the approach angle can turn a missed
+        detection into a confirmed one -- and per-step detection in ``act`` will
+        promote it to a real goal the moment it fires. If we arrive and still see
+        nothing, the spot is marked a dud and we move to the next-best peak, up to
+        ``VLFM_REINSPECT_MAX`` targets, after which we genuinely give up.
+
+        Returns a navigation action toward the current re-inspection target, or
+        ``None`` to let the caller fall through to STOP.
+        """
+        if os.environ.get("VLFM_REINSPECT", "0") != "1" or not self._compute_frontiers:
+            return None
+
+        robot_xy = self._observations_cache["robot_xy"]
+        arrive_r = float(os.environ.get("VLFM_REINSPECT_ARRIVE_RADIUS", "1.0"))
+
+        # Still travelling toward the current target?
+        if self._reinspect_target is not None:
+            if np.linalg.norm(robot_xy - self._reinspect_target) > arrive_r:
+                return self._pointnav(self._reinspect_target, stop=False)
+            # Arrived and still exploring (act() would have taken the navigate branch
+            # if the target were detected) -> this peak was a dud.
+            print(
+                f"[reinspect] arrived at {np.round(self._reinspect_target, 2).tolist()} "
+                "with no confirmed target -> mark dud",
+                flush=True,
+            )
+            self._reinspect_done.append(self._reinspect_target.copy())
+            self._reinspect_target = None
+
+        max_targets = int(os.environ.get("VLFM_REINSPECT_MAX", "3"))
+        if self._reinspect_count >= max_targets:
+            print(f"[reinspect] budget exhausted ({max_targets}) -> giving up", flush=True)
+            return None
+
+        exclude_radius = float(os.environ.get("VLFM_REINSPECT_EXCLUDE_RADIUS", "1.5"))
+        min_value = float(os.environ.get("VLFM_REINSPECT_MIN_VALUE", "0.0"))
+        picked = self._value_map.best_navigable_value_xy(
+            self._obstacle_map,
+            exclude=self._reinspect_done + [robot_xy],
+            exclude_radius=exclude_radius,
+        )
+        if picked is None:
+            print("[reinspect] no qualifying value-map peak left -> giving up", flush=True)
+            return None
+        target_xy, value = picked
+        if value <= min_value:
+            print(f"[reinspect] best value {value:.3f} <= floor {min_value:.3f} -> giving up", flush=True)
+            return None
+
+        self._reinspect_target = np.asarray(target_xy, dtype=np.float64)[:2]
+        self._reinspect_count += 1
+        os.environ["DEBUG_INFO"] = f"Re-inspect #{self._reinspect_count} val={value*100:.1f}%"
+        print(
+            f"[reinspect] target #{self._reinspect_count}/{max_targets} -> "
+            f"{np.round(self._reinspect_target, 2).tolist()} value={value:.3f} (re-approach to re-look)",
+            flush=True,
+        )
+        return self._pointnav(self._reinspect_target, stop=False)
 
     def _get_best_frontier(
         self,

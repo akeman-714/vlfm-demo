@@ -410,7 +410,11 @@ class BaseObjectNavPolicy(BasePolicy):
                 return self._block_unverified_stop(mode)
             return "verify-reject", verified_action
 
-        return self._block_unverified_stop(mode)
+        # _called_stop is False here: the STOP came from exploration giving up (no
+        # frontiers / re-inspection exhausted), not from arriving at a target. Let it
+        # terminate the episode instead of rewriting it into an in-place TURN_RIGHT,
+        # which would livelock (spin without translating) until the step budget runs out.
+        return mode, action
 
     def _is_stop_action(self, action: Any) -> bool:
         if isinstance(action, torch.Tensor) and isinstance(self._stop_action, torch.Tensor):
